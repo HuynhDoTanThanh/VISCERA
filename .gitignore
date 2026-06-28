@@ -1,0 +1,32 @@
+# ---- large data & weights (distributed via Google Drive, NOT git) ----
+dataset/train/         # image dirs go via Drive; dataset/*.csv stay in git
+dataset/val/
+dataset/unlabeled_data/
+out/
+zipfail/
+*.zip
+*.pth
+*.pt
+
+# ---- caches / derived artifacts (regenerable) ----
+agent_system/artifacts/
+phase3/cache/
+*.npz
+*.npy
+
+# ---- colab bundle staging ----
+rare26_concept/
+rare26_concept*.tar.gz
+
+# ---- python / env ----
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ---- os / editor / misc ----
+.DS_Store
+.claude/
+*.log
+*.tmp
