@@ -1,8 +1,12 @@
-# RARE2026 — Barrett's Neoplasia Detection (PPV@90R)
+# VISCERA — VISual-Concept Endoscopy Representation via Attributes
 
-Detect esophageal **neoplasia** (`neo`) vs non-dysplastic Barrett's (`ndbe`) in endoscopy frames.
-Metric: **PPV@90R** at ~1% prevalence (median bootstrap). Hidden test = a **new center** (domain generalization).
-Deployment: offline `--network=none` container, **image-only** at test.
+> A clinician-style detector: an LLM/VLM first teaches the encoder the **visible clinical attributes** a
+> doctor observes (35 atomic concepts: demarcation, mucosal/vascular irregularity, colocalization …), then a
+> head **diagnoses** from that concept-grounded, center-robust representation — instead of opaque SSL features.
+
+**Task (RARE2026 challenge):** detect esophageal **neoplasia** (`neo`) vs non-dysplastic Barrett's (`ndbe`) in
+endoscopy frames. Metric: **PPV@90R** at ~1% prevalence (median bootstrap). Hidden test = a **new center**
+(domain generalization). Deployment: offline `--network=none` container, **image-only** at test.
 
 ## Pipeline
 1. **Phase 1 — VLM concept extraction** (`agent_system/`, `scripts/run.sh`): multi-expert VLM extracts 35 atomic
