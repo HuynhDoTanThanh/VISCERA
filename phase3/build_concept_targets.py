@@ -45,17 +45,18 @@ def scan_unlabeled(label_root="out"):
 
 
 def scan_labeled(csv_path, label_dir):
-    """Labeled frames: image from the dataset csv, concepts from out/<split>/labels by name."""
-    idx = {}
-    for fp in glob.glob(os.path.join(label_dir, "*.json")):
-        d = json.load(open(fp)); idx[d.get("name", os.path.splitext(os.path.basename(fp))[0])] = d
+    """Derive labeled frames + concepts DIRECTLY from out/<split>/labels JSONs
+    (img = out/<split>/images/<name>.jpg). Self-contained: needs NO dataset.zip and NO CSV — works on the
+    Colab out-folder layout and locally. (csv_path is accepted for CLI back-compat but is not required.)"""
+    split_root = os.path.dirname(label_dir.rstrip("/"))  # e.g. out/train
     rows = []
-    for r in csvmod.DictReader(open(csv_path)):
-        nm = os.path.splitext(os.path.basename(r["path"]))[0]
-        rec = idx.get(nm)
-        if rec is None:
+    for fp in glob.glob(os.path.join(label_dir, "*.json")):
+        d = json.load(open(fp))
+        if int(d.get("label", -1)) < 0:
             continue
-        rows.append((r["path"], nm, r.get("center", ""), int(r.get("label", -1)), _arrays(rec)))
+        nm = d.get("name", os.path.splitext(os.path.basename(fp))[0])
+        img = os.path.join(split_root, "images", f"{nm}.jpg")
+        rows.append((img, nm, d.get("center", ""), int(d["label"]), _arrays(d)))
     return rows
 
 
