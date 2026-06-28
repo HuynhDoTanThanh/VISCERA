@@ -96,6 +96,29 @@ class FrameDS(torch.utils.data.Dataset):
         return x, float(self.labels[i])
 
 
+class PosBalancedBatchSampler(torch.utils.data.Sampler):
+    """Each batch carries exactly `pos_per_batch` positives (oversampled) + negatives, so the soft-pAUC /
+    pairwise-rank tail losses ALWAYS fire. Without this, at ~1.5% positive rate a shuffled batch holds <1
+    positive and the operating-point losses are silent no-ops (audit finding)."""
+    def __init__(self, labels, batch_size, pos_per_batch=8, seed=0):
+        self.labels = np.asarray(labels); self.bs = batch_size
+        self.pos = np.where(self.labels == 1)[0]; self.neg = np.where(self.labels == 0)[0]
+        self.ppb = min(pos_per_batch, max(1, len(self.pos))); self.npb = max(1, batch_size - self.ppb)
+        self.nbatches = max(1, len(self.neg) // self.npb); self.epoch = 0; self.seed = seed
+
+    def __len__(self):
+        return self.nbatches
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch); self.epoch += 1
+        neg = rng.permutation(self.neg)
+        for b in range(self.nbatches):
+            nb = neg[b * self.npb:(b + 1) * self.npb]
+            pb = rng.choice(self.pos, self.ppb, replace=len(self.pos) < self.ppb)
+            idx = np.concatenate([pb, nb]); rng.shuffle(idx)
+            yield idx.tolist()
+
+
 # ----------------------------------------------------------------- losses (90R-targeted)
 def pairwise_rank_loss(logits, y, margin=1.0):
     """Encourage every positive to outrank every negative (batch-wise). Directly improves ranking = PPV."""
@@ -160,6 +183,7 @@ def main():
     ap.add_argument("--unfreeze", type=int, default=4)
     ap.add_argument("--init", default="", help="concept-pretrained encoder (pretrain_concept.py) for Stage-2")
     ap.add_argument("--epochs", type=int, default=40); ap.add_argument("--bs", type=int, default=64)
+    ap.add_argument("--pos-per-batch", type=int, default=8, help="positives guaranteed per batch (makes tail loss fire)")
     ap.add_argument("--lr", type=float, default=1e-4); ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--loss", default="bce+rank+pauc", help="bce | rank | pauc | bce+rank+pauc")
     ap.add_argument("--warmup", type=int, default=2, help="epochs of pure BCE before adding tail terms")
@@ -182,9 +206,11 @@ def main():
     print(f"train frames={len(tp)} pos={int(np.sum(tl))} | trainable params={ntrain/1e6:.1f}M | holdout={a.holdout}")
 
     ds = FrameDS(tp, tl, train=True)
-    dl = torch.utils.data.DataLoader(ds, batch_size=a.bs, shuffle=True, num_workers=6, drop_last=True, persistent_workers=True)
-    pos_w = torch.tensor([float((np.array(tl) == 0).sum()) / max(int((np.array(tl) == 1).sum()), 1)],
-                         device=dev, dtype=torch.float32)  # MPS rejects float64
+    sampler = PosBalancedBatchSampler(tl, a.bs, pos_per_batch=a.pos_per_batch)
+    dl = torch.utils.data.DataLoader(ds, batch_sampler=sampler, num_workers=6, persistent_workers=True)
+    # with a balanced sampler the in-batch neg/pos ratio is ~npb/ppb (mild), NOT the ~159 dataset ratio
+    pos_w = torch.tensor([sampler.npb / sampler.ppb], device=dev, dtype=torch.float32)
+    print(f"sampler: {sampler.ppb} pos + {sampler.npb} neg / batch, {sampler.nbatches} batches, pos_weight={pos_w.item():.1f}")
     bce = nn.BCEWithLogitsLoss(pos_weight=pos_w)
     opt = torch.optim.AdamW(layerwise_param_groups(net, a.lr, a.lr_decay), weight_decay=a.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
