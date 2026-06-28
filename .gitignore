@@ -1,5 +1,6 @@
 # ---- large data & weights (distributed via Google Drive, NOT git) ----
-dataset/train/         # image dirs go via Drive; dataset/*.csv stay in git
+# image dirs go via Drive; dataset/*.csv stay in git
+dataset/train/
 dataset/val/
 dataset/unlabeled_data/
 out/
