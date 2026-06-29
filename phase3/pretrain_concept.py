@@ -134,6 +134,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=15); ap.add_argument("--bs", type=int, default=96)
     ap.add_argument("--unfreeze", type=int, default=6); ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=0.05); ap.add_argument("--grl", type=float, default=1.0)
+    ap.add_argument("--l2sp", type=float, default=1.0,
+                    help="L2-SP anchor to SSL init (keeps concepts from OVERWRITING SSL features; 0=off). KEY lever.")
     ap.add_argument("--limit", type=int, default=0, help="debug subset")
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
@@ -161,7 +163,9 @@ def main():
                                      drop_last=True, persistent_workers=a.workers > 0)
     net = ConceptNet(main_idx, center_idx, a.unfreeze).to(dev)
     tp = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"trainable params={tp/1e6:.1f}M")
+    print(f"trainable params={tp/1e6:.1f}M  l2sp={a.l2sp}")
+    # L2-SP reference: snapshot the trainable backbone weights at SSL init (anchor to keep features)
+    sp_ref = {n: p.detach().clone() for n, p in net.backbone.named_parameters() if p.requires_grad} if a.l2sp > 0 else {}
     opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=a.lr, weight_decay=a.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
     bce = nn.BCEWithLogitsLoss(reduction="none")
@@ -178,6 +182,9 @@ def main():
                 lm = (bce(pm, mv) * mw).sum() / (mw.sum() + 1e-6)            # trust-weighted concept distillation
                 lc = (bce(pc, cv) * cw).sum() / (cw.sum() + 1e-6) if len(center_idx) else x.sum() * 0
                 loss = lm + lc                                              # GRL makes lc push center info OUT
+                if sp_ref:                                                  # L2-SP: anchor to SSL init (anti-forgetting)
+                    sp = sum(((p - sp_ref[n]) ** 2).mean() for n, p in net.backbone.named_parameters() if n in sp_ref)
+                    loss = loss + a.l2sp * sp
             if amp:
                 scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
             else:
