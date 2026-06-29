@@ -129,14 +129,15 @@ def pairwise_rank_loss(logits, y, margin=1.0):
     return torch.nn.functional.softplus(margin - diff).mean()
 
 
-def soft_pauc90(logits, y, q=0.1):
-    """Soft partial-AUC at the 90R operating point: penalize negatives scoring above the
-    ~10th-percentile positive (the threshold where recall=90%). Targets exactly the FP tail PPV@90R sees."""
-    pos, neg = logits[y == 1], logits[y == 0]
+def soft_pauc90(logits, y, q=0.2):
+    """Soft partial-AUC at the 90R operating point: penalize negatives scoring above the low-percentile
+    positive (the threshold where recall~90%). q=0.2 (not 0.1) since only ~8 positives/batch. Targets the
+    FP tail PPV@90R sees. (quantile needs float32 — AMP gives half.)"""
+    pos, neg = logits[y == 1].float(), logits[y == 0].float()
     if len(pos) < 2 or len(neg) == 0:
         return logits.sum() * 0.0
     thr = torch.quantile(pos, q)
-    return torch.nn.functional.softplus(neg - thr).mean()
+    return torch.nn.functional.softplus(neg - thr).mean().to(logits.dtype)
 
 
 def layerwise_param_groups(net, base_lr, decay=0.75, head_lr_mult=10.0):
