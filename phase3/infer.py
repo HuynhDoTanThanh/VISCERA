@@ -18,23 +18,28 @@ from phase3.featurize import featurize_paths
 from phase3.ship import score_features
 
 
-def _score_finetuned(pt_path, paths, bs=32):
-    """Score with a fine-tuned Net (.pt), hflip-TTA averaged."""
+def _score_finetuned(pt_paths, paths, bs=32):
+    """Score with one or more fine-tuned Nets (.pt), hflip-TTA + probability-averaged across models (ensemble)."""
     import torch
     from phase3.finetune import Net, FrameDS, device
-    ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
+    if isinstance(pt_paths, str):
+        pt_paths = [pt_paths]
     dev = device()
-    net = Net(ckpt["cfg"].get("unfreeze", 4)).to(dev)
-    net.load_state_dict(ckpt["model"]); net.eval()
     ds = FrameDS(list(paths), [0] * len(paths), train=False)
-    dl = torch.utils.data.DataLoader(ds, batch_size=bs, num_workers=0)
-    out = []
-    with torch.no_grad():
-        for x, _ in dl:
-            x = x.to(dev)
-            s = (torch.sigmoid(net(x)) + torch.sigmoid(net(torch.flip(x, dims=[-1])))) / 2  # hflip TTA
-            out.append(s.float().cpu().numpy())
-    return np.concatenate(out)
+    acc = np.zeros(len(paths), dtype=np.float64)
+    for pt in pt_paths:
+        ckpt = torch.load(pt, map_location="cpu", weights_only=False)
+        net = Net(ckpt["cfg"].get("unfreeze", 4)).to(dev)
+        net.load_state_dict(ckpt["model"]); net.eval()
+        dl = torch.utils.data.DataLoader(ds, batch_size=bs, num_workers=0)
+        out = []
+        with torch.no_grad():
+            for x, _ in dl:
+                x = x.to(dev)
+                s = (torch.sigmoid(net(x)) + torch.sigmoid(net(torch.flip(x, dims=[-1])))) / 2  # hflip TTA
+                out.append(s.float().cpu().numpy())
+        acc += np.concatenate(out); print(f"  scored with {pt}")
+    return acc / len(pt_paths)
 
 
 def main():
@@ -47,7 +52,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     a = ap.parse_args()
 
-    finetuned = a.model.endswith(".pt")
+    finetuned = a.model.endswith(".pt") or "," in a.model   # one or more .pt (comma-sep) = fine-tuned ensemble
     if not finetuned:
         with open(a.model, "rb") as f:
             artifact = pickle.load(f)
@@ -64,7 +69,8 @@ def main():
 
     print(f"scoring {len(paths)} images ({'fine-tuned .pt' if finetuned else 'frozen ensemble .pkl'})", flush=True)
     if finetuned:
-        scores = _score_finetuned(a.model, paths, a.batch_size)
+        models = [m.strip() for m in a.model.split(",") if m.strip()]
+        scores = _score_finetuned(models, paths, a.batch_size)
     else:
         z = featurize_paths(paths, batch_size=a.batch_size, workers=a.workers)
         scores = score_features(artifact, z)

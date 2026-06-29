@@ -186,6 +186,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=40); ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--pos-per-batch", type=int, default=8, help="positives guaranteed per batch (makes tail loss fire)")
     ap.add_argument("--lr", type=float, default=1e-4); ap.add_argument("--wd", type=float, default=0.05)
+    ap.add_argument("--seed", type=int, default=0, help="for multi-seed ensembling + reproducibility")
+    ap.add_argument("--wise-ft", type=float, default=1.0,
+                    help="WiSE-FT: final backbone = a*FT + (1-a)*init; 1.0=pure FT, <1 interpolates toward SSL init (robustness)")
     ap.add_argument("--loss", default="bce+rank+pauc", help="bce | rank | pauc | bce+rank+pauc")
     ap.add_argument("--warmup", type=int, default=2, help="epochs of pure BCE before adding tail terms")
     ap.add_argument("--lr-decay", type=float, default=0.75, help="layer-wise LR decay factor")
@@ -202,12 +205,14 @@ def main():
     if extra_neg:
         tp += extra_neg; tl += [0] * len(extra_neg)
         print(f"+ {len(extra_neg)} unlabeled negatives")
+    torch.manual_seed(a.seed); np.random.seed(a.seed)
     net = Net(a.unfreeze, init_ckpt=a.init or None).to(dev)
+    init_bb = {k: v.detach().cpu().clone() for k, v in net.backbone.state_dict().items()}  # for WiSE-FT
     ntrain = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"train frames={len(tp)} pos={int(np.sum(tl))} | trainable params={ntrain/1e6:.1f}M | holdout={a.holdout}")
 
     ds = FrameDS(tp, tl, train=True)
-    sampler = PosBalancedBatchSampler(tl, a.bs, pos_per_batch=a.pos_per_batch)
+    sampler = PosBalancedBatchSampler(tl, a.bs, pos_per_batch=a.pos_per_batch, seed=a.seed)
     dl = torch.utils.data.DataLoader(ds, batch_sampler=sampler, num_workers=6, persistent_workers=True)
     # with a balanced sampler the in-batch neg/pos ratio is ~npb/ppb (mild), NOT the ~159 dataset ratio
     pos_w = torch.tensor([sampler.npb / sampler.ppb], device=dev, dtype=torch.float32)
@@ -256,6 +261,16 @@ def main():
         torch.save({"model": net.state_dict(), "cfg": vars(a)}, a.out)
         print(f"saved ship model -> {a.out}")
     print(f"best LOCO-val PPV@90R = {best:.4f}")
+
+    # WiSE-FT: interpolate the saved backbone toward the SSL init (robustness; pick alpha on inner val)
+    if a.wise_ft < 1.0 and os.path.exists(a.out):
+        ck = torch.load(a.out, map_location="cpu", weights_only=False); st = ck["model"]
+        for k, v in init_bb.items():
+            bk = f"backbone.{k}"
+            if bk in st and st[bk].shape == v.shape:
+                st[bk] = (a.wise_ft * st[bk].float() + (1 - a.wise_ft) * v.float()).to(st[bk].dtype)
+        ck["model"] = st; torch.save(ck, a.out)
+        print(f"applied WiSE-FT alpha={a.wise_ft} -> {a.out}")
 
 
 if __name__ == "__main__":
