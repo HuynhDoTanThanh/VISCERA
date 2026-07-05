@@ -4,6 +4,8 @@ dataset/train/
 dataset/val/
 dataset/unlabeled_data/
 out/
+exps/
+RARE25-Submission/
 zipfail/
 *.zip
 *.pth
