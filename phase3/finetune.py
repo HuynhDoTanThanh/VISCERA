@@ -173,7 +173,8 @@ def evaluate_center(net, paths, labels, centers, dev, bs=64):
     for x, _ in dl:
         sc.append(torch.sigmoid(net(x.to(dev))).float().cpu().numpy())
     s = np.concatenate(sc)
-    return ev.bootstrap(np.array(labels), s, np.array(centers), target=0.9, prevalence=0.01, B=500)["curve"]["median"], s
+    r = ev.report_full(np.array(labels), s, np.array(centers), target=0.9, prevalence=0.01, B=500)
+    return r, s
 
 
 def main():
@@ -250,8 +251,12 @@ def main():
         sched.step()
         msg = f"ep{ep+1}/{a.epochs} loss={tot/len(dl):.4f}"
         if vam.any():
-            ppv, _ = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
-            msg += f"  LOCO-val({a.holdout}) PPV@90R={ppv:.4f}"
+            r, _ = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
+            ppv = r["ppv90"]
+            # AUROC/AUPRC are threshold-free & STABLE across epochs — trust them to read the trend;
+            # PPV@90R bounces on few positives. Selection stays on PPV (the leaderboard metric).
+            msg += (f"  LOCO-val({a.holdout}) PPV@90R={ppv:.4f} CI[{r['ci_lo']:.3f},{r['ci_hi']:.3f}]"
+                    f" AUROC={r['auroc']:.3f} AUPRC={r['auprc']:.3f}")
             if ppv > best:
                 best = ppv
                 torch.save({"model": net.state_dict(), "cfg": vars(a), "loco_ppv90": best}, a.out)

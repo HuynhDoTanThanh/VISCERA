@@ -55,11 +55,14 @@ def main():
         legs = _loco_scores(zf, y, c, g, pn, a.C)
         cis = [ev.bootstrap(yte, sc, cte, target=a.recall, prevalence=0.01, B=1000)["curve"]
                for _, sc, yte, cte, _ in legs]
+        aucs = [ev.auc_metrics(yte, sc) for _, sc, yte, cte, _ in legs]
         res[name] = (legs, cis)
         meds = [ci["median"] for ci in cis]
-        print(f"  {name:8s} c1->c2={cis[0]['median']:.3f}[{cis[0]['lo']:.3f},{cis[0]['hi']:.3f}]"
+        print(f"  {name:8s} PPV@90R  c1->c2={cis[0]['median']:.3f}[{cis[0]['lo']:.3f},{cis[0]['hi']:.3f}]"
               f"  c2->c1={cis[1]['median']:.3f}[{cis[1]['lo']:.3f},{cis[1]['hi']:.3f}]"
               f"  mean={np.mean(meds):.3f}  worst={min(meds):.3f}")
+        print(f"  {'':8s} AUROC    c1->c2={aucs[0]['auroc']:.3f}              c2->c1={aucs[1]['auroc']:.3f}"
+              f"          | AUPRC c1->c2={aucs[0]['auprc']:.3f} c2->c1={aucs[1]['auprc']:.3f}  (stable at few pos)")
 
     # paired bootstrap per leg (same held-out frames -> aligned scores). The delta CI crossing 0 is the
     # honest "cannot distinguish" signal — more reliable than comparing two noisy point estimates.

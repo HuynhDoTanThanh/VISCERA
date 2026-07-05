@@ -18,6 +18,7 @@ import glob
 import json
 import os
 import numpy as np
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 
 # ----------------------------------------------------------------- metric primitives
@@ -72,6 +73,27 @@ def fpr_at_recall(y, s, target=0.9):
         return np.nan
     neg = y == 0
     return float((s[neg] >= thr).sum() / max(neg.sum(), 1))
+
+
+# ----------------------------------------------------------------- threshold-free ranking metrics
+def auc_metrics(y, s):
+    """AUROC + AUPRC — threshold-free, STABLE even at few positives (unlike PPV@90R). AUROC is
+    prevalence-independent; AUPRC is at the set's NATURAL prevalence (not reweighted to 1%). Both measure
+    RANKING quality: a high AUROC can coexist with a near-floor PPV@90R@1% — trust them for stability, not
+    as the operating-point score."""
+    y = np.asarray(y); s = np.asarray(s)
+    if len(np.unique(y)) < 2:
+        return dict(auroc=float("nan"), auprc=float("nan"))
+    return dict(auroc=float(roc_auc_score(y, s)), auprc=float(average_precision_score(y, s)))
+
+
+def report_full(y, s, center=None, target=0.9, prevalence=0.01, B=2000, seed=12345):
+    """The 5 trusted numbers in one call: PPV@{target}R (bootstrap median) + 95% CI [lo,hi] at `prevalence`,
+    plus AUROC + AUPRC. Returns a flat dict; callers just format it."""
+    b = bootstrap(y, s, center, target=target, prevalence=prevalence, B=B, seed=seed)["curve"]
+    a = auc_metrics(y, s)
+    return dict(ppv90=b.get("median", float("nan")), ci_lo=b.get("lo", float("nan")), ci_hi=b.get("hi", float("nan")),
+                auroc=a["auroc"], auprc=a["auprc"], n=int(len(y)), pos=int((np.asarray(y) == 1).sum()))
 
 
 # ----------------------------------------------------------------- resampling
