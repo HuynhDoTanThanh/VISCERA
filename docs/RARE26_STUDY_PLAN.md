@@ -105,6 +105,17 @@ The metric is noise-dominated (PPV@90R CIs overlap ~85%). Tighten the ruler BEFO
 |---|---|---|---|---|---|---|---|---|---|---|
 | 2026-07-05 | exp1 | baseline (ship 3-seed + 5-view TTA) | 0,1,2 | f89c89a | — | — | — | — | ✅ 0.0181 [0.0106, 0.0901] | AUROC 0.845, AUPRC 0.356; top-1 = 0.0271 |
 
+## 9b. Submission-budget strategy (1 submission / WEEK)
+
+**Experiments are LOCAL and free; only the hidden-test eval is rate-limited. NEVER submit to test an idea — submit to DELIVER a locally-validated bundle.** Attribution comes from local LOCO ablation, not from submissions.
+
+1. **Strengthen the local proxy so decisions rarely need the hidden test:**
+   - **Acquire the RARE25 validation set locally** if it is public (prior challenge / Zenodo / GC archive). It IS the "Validation RARE25" the platform scores on every submission → an unlimited, on-distribution proxy (NOT our optimistic 2-center `out/val`). **Highest-value action — check first.**
+   - Upgrade LOCO: lesion-bootstrap, 2-fold both directions, seed-averaged (§7).
+2. **All Tier-1/2 levers COMPOSE** into one recipe: `mined-neg data → SAM → SWAD → seed×aug pool → gated ensemble → 5-view TTA`. Develop as 2 bundles: **A (safe: SWAD + aug-diversity + gated ensemble; SWAD is free to ablate — post-hoc average of the same run)** and **B (risky: hard-neg mining; ablate alone for PU contamination).**
+3. **Merge calendar:** Week 0 = no submit (build proxy + local ablation). **Submit #1 = the maximal bundle** of everything that passed the local gate. Submit #2+ = Tier-2 increments (ViT-L member) as each passes locally.
+4. **Best-vs-last decides aggressiveness:** if the leaderboard keeps your **BEST** submission → bundle everything into Submit #1 (a failed bundle costs nothing — exp1 stays); if it keeps your **LAST** → submit only the safe Bundle A first, keep mining revertible. **CONFIRM THIS POLICY.**
+
 ## 9. Decision rules (how to not fool yourself)
 
 - **Better ⇔ paired-Δ CI vs current best is clear of 0 on LOCO AUROC/AUPRC.** Point gains without that = noise.
