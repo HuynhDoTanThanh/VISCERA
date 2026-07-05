@@ -1,9 +1,17 @@
 """Phase-3 end-to-end fine-tune — the cross-center CEILING-RAISER (run on a CUDA GPU).
 
-A frozen probe on cached DINOv2 features tops out ~0.2-0.28 LOCO-mean PPV@90R because it cannot change
-the features. Fine-tuning the last K transformer blocks + head, with HEAVY photometric+geometric
-augmentation (simulating the scope/lighting nuisance an unseen center introduces) and a LOCO-selected
-operating objective, is the lever that can learn genuinely center-invariant neoplasia features.
+Two Stage-2 regimes, selectable per the encoder you start from:
+  * FINE-TUNE (default, --unfreeze K): unfreeze the last K blocks + head, HEAVY photometric+geometric
+    augmentation (simulating the scope/lighting nuisance an unseen center introduces) + a LOCO-selected
+    operating objective. On the RAW SSL backbone a frozen probe tops out ~0.2-0.28 LOCO-mean PPV@90R
+    (it cannot change the features), so moving the blocks is the lever that learns center-invariant features.
+  * HEAD-ONLY (--head-only): freeze the ENTIRE encoder, train only the linear head. This is the natural
+    readout for the CONCEPT-PRETRAINED encoder (pretrain_concept.py --init): Phase-1 already made the
+    features clinically-grounded + center-invariant, and fine-tuning the blocks would DISTORT them out-of-
+    distribution (Kumar et al. 2022, "fine-tuning can distort pretrained features and underperform OOD").
+    Fewest params -> least overfit when positives are scarce and SD >> margins. It is only as strong as the
+    Phase-1 encoder, so treat FINE-TUNE vs HEAD-ONLY as a LOCO A/B, never a foregone conclusion.
+    (LP-FT = head-only first, then a short low-LR unfreeze — the best-of-both; WiSE-FT is its weight-space cousin.)
 
 Device-portable (cuda preferred, mps/cpu fallback). AMP on cuda. Selects on a held-out CENTER (LOCO)
 via the PPV@90R bootstrap harness — the honest new-center proxy. Saves backbone+head for the offline
@@ -12,6 +20,9 @@ via the PPV@90R bootstrap harness — the honest new-center proxy. Saves backbon
 Run on cloud GPU:
     python -m phase3.finetune --unfreeze 4 --epochs 40 --holdout center_2 --bs 64 \
         --neg-list phase3/cache/unl_confneg.txt --neg-cap 6000 --out phase3/cache/ft_holdout_c2.pt
+    # head-only readout of the concept encoder (preserves Phase-1 invariance):
+    python -m phase3.finetune --head-only --init phase3/cache/concept_encoder.pt --epochs 30 \
+        --holdout center_2 --out phase3/cache/lp_holdout_c2.pt
     # then swap --holdout center_1 to see both legs; ship a model trained on BOTH centers (--holdout none).
 """
 from __future__ import annotations
@@ -40,7 +51,7 @@ class Net(nn.Module):
     init_ckpt: optional concept-pretrained encoder (pretrain_concept.py output) to start from instead
     of the raw SSL teacher — this is Stage-2 of the concept-supervised pipeline.
     """
-    def __init__(self, unfreeze=4, init_ckpt=None):
+    def __init__(self, unfreeze=4, init_ckpt=None, head_only=False):
         super().__init__()
         m = timm.create_model("vit_base_patch14_reg4_dinov2", pretrained=False, img_size=IMG, num_classes=0)
         teacher = torch.load(CKPT, map_location="cpu", weights_only=False)["teacher"]
@@ -54,15 +65,18 @@ class Net(nn.Module):
             m2, u2 = m.load_state_dict(ck["backbone"], strict=False)
             print(f"[init] loaded concept-pretrained backbone from {init_ckpt} (missing={len(m2)} unexpected={len(u2)})")
         self.backbone = m
-        # freeze all, then unfreeze last `unfreeze` blocks + final norm
+        self.head_only = head_only
+        # freeze all; then (unless head_only) unfreeze last `unfreeze` blocks + final norm. head_only keeps the
+        # ENTIRE encoder frozen (pure linear probe) — the head's own LayerNorm still adapts feature scaling.
         for p in m.parameters():
             p.requires_grad_(False)
-        nblocks = len(m.blocks)
-        for i in range(max(0, nblocks - unfreeze), nblocks):
-            for p in m.blocks[i].parameters():
+        if not head_only:
+            nblocks = len(m.blocks)
+            for i in range(max(0, nblocks - unfreeze), nblocks):
+                for p in m.blocks[i].parameters():
+                    p.requires_grad_(True)
+            for p in m.norm.parameters():
                 p.requires_grad_(True)
-        for p in m.norm.parameters():
-            p.requires_grad_(True)
         self.head = nn.Sequential(nn.LayerNorm(2 * 768), nn.Linear(2 * 768, 1))
 
     def forward(self, x):
@@ -183,6 +197,9 @@ def main():
     ap.add_argument("--holdout", default="center_2", help="center to hold out for LOCO val; 'none' = train on all (ship)")
     ap.add_argument("--neg-list", default=""); ap.add_argument("--neg-cap", type=int, default=6000)
     ap.add_argument("--unfreeze", type=int, default=4)
+    ap.add_argument("--head-only", action="store_true",
+                    help="freeze the ENTIRE encoder; train only the linear head (LP readout of the concept "
+                         "encoder — preserves Phase-1 center-invariance; Kumar et al. 2022: LP>FT under OOD shift)")
     ap.add_argument("--init", default="", help="concept-pretrained encoder (pretrain_concept.py) for Stage-2")
     ap.add_argument("--epochs", type=int, default=40); ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--pos-per-batch", type=int, default=8, help="positives guaranteed per batch (makes tail loss fire)")
@@ -207,10 +224,11 @@ def main():
         tp += extra_neg; tl += [0] * len(extra_neg)
         print(f"+ {len(extra_neg)} unlabeled negatives")
     torch.manual_seed(a.seed); np.random.seed(a.seed)
-    net = Net(a.unfreeze, init_ckpt=a.init or None).to(dev)
+    net = Net(a.unfreeze, init_ckpt=a.init or None, head_only=a.head_only).to(dev)
     init_bb = {k: v.detach().cpu().clone() for k, v in net.backbone.state_dict().items()}  # for WiSE-FT
     ntrain = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"train frames={len(tp)} pos={int(np.sum(tl))} | trainable params={ntrain/1e6:.1f}M | holdout={a.holdout}")
+    mode = "HEAD-ONLY (frozen encoder linear probe)" if a.head_only else f"unfreeze last {a.unfreeze} blocks"
+    print(f"train frames={len(tp)} pos={int(np.sum(tl))} | {mode} | trainable params={ntrain/1e6:.3f}M | holdout={a.holdout}")
 
     ds = FrameDS(tp, tl, train=True)
     sampler = PosBalancedBatchSampler(tl, a.bs, pos_per_batch=a.pos_per_batch, seed=a.seed)
@@ -237,6 +255,8 @@ def main():
     best = -1
     for ep in range(a.epochs):
         net.train(); tot = 0
+        if net.head_only:
+            net.backbone.eval()         # frozen encoder -> deterministic features (no drop_path/dropout noise)
         tail = ep >= a.warmup           # warm-start on BCE, then add the 90R tail terms
         for x, y in dl:
             x, y = x.to(dev), y.float().to(dev)   # cast float64->float32 on CPU BEFORE moving (MPS rejects float64)
@@ -267,8 +287,9 @@ def main():
         print(f"saved ship model -> {a.out}")
     print(f"best LOCO-val PPV@90R = {best:.4f}")
 
-    # WiSE-FT: interpolate the saved backbone toward the SSL init (robustness; pick alpha on inner val)
-    if a.wise_ft < 1.0 and os.path.exists(a.out):
+    # WiSE-FT: interpolate the saved backbone toward the SSL init (robustness; pick alpha on inner val).
+    # No-op under --head-only (the backbone never moved), so skip it.
+    if a.wise_ft < 1.0 and not a.head_only and os.path.exists(a.out):
         ck = torch.load(a.out, map_location="cpu", weights_only=False); st = ck["model"]
         for k, v in init_bb.items():
             bk = f"backbone.{k}"
