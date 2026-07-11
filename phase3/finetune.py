@@ -45,26 +45,52 @@ def device():
 
 
 # ----------------------------------------------------------------- model
+BACKBONES = {   # name -> (timm model, weights file). BOTH have 5 prefix tokens (1 cls + 4 reg) + embed 768 -> SAME head.
+    "dinov2": ("vit_base_patch14_reg4_dinov2", "dinov2.pth"),   # teacher-format ckpt; patch14 -> 576 patches @336
+    "dinov3": ("vit_base_patch16_dinov3", "dinov3.pth"),        # plain timm state_dict; patch16 -> 784 patches @448
+}
+
+
+class AttnPool(nn.Module):
+    """Gated attention-MIL pooling (Ilse et al. 2018) over patch tokens: a subtle lesion of a FEW patches can
+    dominate the pooled vector instead of being divided by ~1024 (mean-pool dilution). Per-image (softmax over the
+    token axis) — no batch stats, ships in the LayerNorm-only graph. Returns (pooled, attention)."""
+    def __init__(self, dim=768, hid=128):
+        super().__init__()
+        self.V = nn.Linear(dim, hid, bias=False)
+        self.U = nn.Linear(dim, hid, bias=False)
+        self.w = nn.Linear(hid, 1, bias=False)
+
+    def forward(self, p):                                     # p: (B, N, dim)
+        a = self.w(torch.tanh(self.V(p)) * torch.sigmoid(self.U(p))).squeeze(-1)   # (B, N)
+        a = torch.softmax(a, dim=1)
+        return (a.unsqueeze(-1) * p).sum(1), a               # (B, dim), (B, N)
+
+
 class Net(nn.Module):
-    """DINOv2 ViT-B/14-reg backbone (last K blocks trainable) + [cls ⊕ patch_mean] linear head.
+    """DINOv2 ViT-B/14-reg backbone (last K blocks trainable) + [cls ⊕ pooled-patch] linear head.
+    Pooling = mean (default) or gated attention-MIL (cg_head=True) that lifts a few-patch lesion (the tail lever).
 
     init_ckpt: optional concept-pretrained encoder (pretrain_concept.py output) to start from instead
     of the raw SSL teacher — this is Stage-2 of the concept-supervised pipeline.
     """
-    def __init__(self, unfreeze=4, init_ckpt=None, head_only=False):
+    def __init__(self, unfreeze=4, init_ckpt=None, head_only=False, cg_head=False, backbone="dinov3"):
         super().__init__()
-        m = timm.create_model("vit_base_patch14_reg4_dinov2", pretrained=False, img_size=IMG, num_classes=0)
-        teacher = torch.load(CKPT, map_location="cpu", weights_only=False)["teacher"]
-        bk = {k[len("backbone."):]: v for k, v in teacher.items() if k.startswith("backbone.")}
         from timm.models import vision_transformer as vit_mod
-        conv = vit_mod.checkpoint_filter_fn(bk, m); conv.pop("mask_token", None)
+        model_name, ckpt_path = BACKBONES[backbone]
+        m = timm.create_model(model_name, pretrained=False, img_size=IMG, num_classes=0)
+        sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if backbone == "dinov2":                                    # teacher-format checkpoint -> extract backbone.*
+            sd = {k[len("backbone."):]: v for k, v in sd["teacher"].items() if k.startswith("backbone.")}
+        conv = vit_mod.checkpoint_filter_fn(sd, m); conv.pop("mask_token", None)
         miss, unexp = m.load_state_dict(conv, strict=False)
-        assert not miss and not unexp, f"backbone mismatch {miss} {unexp}"
+        assert not miss and not unexp, f"backbone {backbone} mismatch: missing={list(miss)[:4]} unexpected={list(unexp)[:4]}"
         if init_ckpt:
             ck = torch.load(init_ckpt, map_location="cpu", weights_only=False)
-            m2, u2 = m.load_state_dict(ck["backbone"], strict=False)
-            # fail loud (like the SSL load above) — else a future key drift silently reverts to raw SSL and
-            # mis-attributes the result of the single submission to concept-init.
+            bk2 = vit_mod.checkpoint_filter_fn(ck["backbone"], m)   # interpolates pos_embed if IMG changed (336->448)
+            bk2.pop("mask_token", None)
+            m2, u2 = m.load_state_dict(bk2, strict=False)
+            # fail loud (like the SSL load above) — else a future key drift silently reverts to raw SSL.
             assert not m2 and not u2, f"concept-init key mismatch: missing={m2[:4]} unexpected={u2[:4]}"
             print(f"[init] loaded concept-pretrained backbone from {init_ckpt}")
         self.backbone = m
@@ -81,11 +107,18 @@ class Net(nn.Module):
             for p in m.norm.parameters():
                 p.requires_grad_(True)
         self.head = nn.Sequential(nn.LayerNorm(2 * 768), nn.Linear(2 * 768, 1))
+        self.cg_head = cg_head
+        self.attn = AttnPool(768, 128) if cg_head else None   # ~0.2M params; only added key set vs mean-pool
 
-    def forward(self, x):
-        f = self.backbone.forward_features(x)            # (B, 1+4+576, 768)
-        feat = torch.cat([f[:, 0], f[:, 5:].mean(1)], -1)
-        return self.head(feat).squeeze(-1)
+    def forward(self, x, return_attn=False):
+        f = self.backbone.forward_features(x)            # (B, 1+4+N, 768)  N=576@336 / 1024@448
+        patches = f[:, 5:]
+        if self.cg_head:
+            pooled, a = self.attn(patches)               # attention-weighted pool (lifts few-patch lesion)
+        else:
+            pooled, a = patches.mean(1), None            # mean-pool (dilutes)
+        logit = self.head(torch.cat([f[:, 0], pooled], -1)).squeeze(-1)   # cls kept as stable residual
+        return (logit, a) if return_attn else logit
 
 
 # ----------------------------------------------------------------- data
@@ -279,6 +312,16 @@ def main():
                          "labeled (high suspicion includes NDBE look-alikes) -> one-sided PU.")
     ap.add_argument("--ema-decay", type=float, default=0.99, help="EMA teacher decay for the consistency target")
     ap.add_argument("--semi-rampup", type=int, default=5, help="epochs to ramp the semi weight 0->1 after --warmup")
+    # ---- CG-AMIL head: gated attention-MIL pooling (lifts a few-patch lesion vs mean-pool) + entropy floor ----
+    ap.add_argument("--backbone", choices=["dinov2", "dinov3"], default="dinov3",
+                    help="dinov3 = ViT-B/16 (stronger dense/patch features, needs dinov3.pth); dinov2 = ViT-B/14-reg "
+                         "(Apache-2.0, dinov2.pth, the exp1 0.018 path). Both: 5 prefix + embed 768 -> same head.")
+    ap.add_argument("--cg-head", action="store_true",
+                    help="use gated attention-MIL pooling instead of mean-pool (the tail lever; ~0.2M params, "
+                         "regularized by the SEMI 288k-pool consistency + entropy floor). Ship graph gains attn.* keys.")
+    ap.add_argument("--attn-entropy", type=float, default=0.02,
+                    help="entropy regularizer on the attention map (maximize H -> anti-collapse: forbids 1-hot "
+                         "attention that memorizes a single patch/center cue). Only used with --cg-head.")
     ap.add_argument("--semi-steps", type=int, default=1,
                     help="unlabeled batches per labeled step (grad-accumulated). >1 uses MORE of the pool per epoch "
                          "with fresh strong-aug each, WITHOUT repeating the labeled set more. Coverage/epoch = "
@@ -293,7 +336,8 @@ def main():
     ap.add_argument("--swad-last-n", type=int, default=5, help="number of final epochs to average for SWAD")
     ap.add_argument("--out", default="phase3/cache/ft.pt")
     a = ap.parse_args()
-    dev = device(); print(f"device={dev}")
+    a.img = IMG                              # stamp the training image size into cfg so the container reconstructs exactly
+    dev = device(); print(f"device={dev} | backbone={a.backbone} | img={IMG} | cg_head={a.cg_head}")
     if a.holdout == "none" and a.wise_ft >= 1.0 and not a.head_only:
         print("WARNING: shipping PURE FT (--wise-ft 1.0, no OOD anchor). The recipe is --wise-ft 0.7 [--swad]; "
               "a bare invocation ships the least-robust model.", flush=True)
@@ -308,7 +352,7 @@ def main():
         tp += extra_neg; tl += [0] * len(extra_neg)
         print(f"+ {len(extra_neg)} unlabeled negatives")
     torch.manual_seed(a.seed); np.random.seed(a.seed)
-    net = Net(a.unfreeze, init_ckpt=a.init or None, head_only=a.head_only).to(dev)
+    net = Net(a.unfreeze, init_ckpt=a.init or None, head_only=a.head_only, cg_head=a.cg_head, backbone=a.backbone).to(dev)
     init_bb = {k: v.detach().cpu().clone() for k, v in net.backbone.state_dict().items()}  # for WiSE-FT
     ntrain = sum(p.numel() for p in net.parameters() if p.requires_grad)
     mode = "HEAD-ONLY (frozen encoder linear probe)" if a.head_only else f"unfreeze last {a.unfreeze} blocks"
@@ -374,7 +418,13 @@ def main():
             x, y = x.to(dev), y.float().to(dev)   # cast float64->float32 on CPU BEFORE moving (MPS rejects float64)
             opt.zero_grad()
             with torch.autocast(device_type="cuda", enabled=amp):
-                sup = compute_loss(net(x), y, tail)                  # supervised (labeled) loss
+                if a.cg_head:
+                    logit, attn = net(x, return_attn=True)
+                    sup = compute_loss(logit, y, tail)
+                    ent = -(attn * (attn + 1e-8).log()).sum(1).mean()   # attention entropy (per image, mean)
+                    sup = sup - a.attn_entropy * ent                    # maximize H -> anti-collapse (anti-memorize)
+                else:
+                    sup = compute_loss(net(x), y, tail)                 # supervised (labeled) loss
             if amp:
                 scaler.scale(sup).backward()
             else:
@@ -389,7 +439,7 @@ def main():
                         xw, xs, susp = next(semi_iter)
                     except StopIteration:
                         semi_iter = iter(semi_dl); xw, xs, susp = next(semi_iter)
-                    xw, xs, susp = xw.to(dev), xs.to(dev), susp.to(dev)
+                    xw, xs, susp = xw.to(dev), xs.to(dev), susp.float().to(dev)   # susp collates to f64 -> f32 (MPS-safe)
                     with torch.autocast(device_type="cuda", enabled=amp):
                         with torch.no_grad():
                             pt = torch.sigmoid(ema(xw))              # EMA-teacher prob on the WEAK view

@@ -41,7 +41,8 @@ def _score_finetuned(pt_paths, paths, bs=32, tta="hflip"):
     acc = np.zeros(len(paths), dtype=np.float64)
     for pt in pt_paths:
         ckpt = torch.load(pt, map_location="cpu", weights_only=False)
-        net = Net(ckpt["cfg"].get("unfreeze", 4)).to(dev)
+        cfg = ckpt.get("cfg", {})
+        net = Net(cfg.get("unfreeze", 4), cg_head=cfg.get("cg_head", False), backbone=cfg.get("backbone", "dinov2")).to(dev)
         net.load_state_dict(ckpt["model"]); net.eval()
         dl = torch.utils.data.DataLoader(ds, batch_size=bs, num_workers=0)
         out = []

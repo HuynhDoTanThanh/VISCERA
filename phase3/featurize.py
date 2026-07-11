@@ -32,7 +32,7 @@ import timm
 from PIL import Image
 
 CKPT = "dinov2.pth"
-IMG = 336
+IMG = 448   # 448/14 = 32 -> 32x32 = 1024 patch tokens (was 336->576); finer lesion localization for attention-MIL
 EMBED = 768
 POOL_NAMES = ("cls", "reg_mean", "patch_mean", "patch_max")
 _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
