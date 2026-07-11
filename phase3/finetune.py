@@ -63,7 +63,10 @@ class Net(nn.Module):
         if init_ckpt:
             ck = torch.load(init_ckpt, map_location="cpu", weights_only=False)
             m2, u2 = m.load_state_dict(ck["backbone"], strict=False)
-            print(f"[init] loaded concept-pretrained backbone from {init_ckpt} (missing={len(m2)} unexpected={len(u2)})")
+            # fail loud (like the SSL load above) — else a future key drift silently reverts to raw SSL and
+            # mis-attributes the result of the single submission to concept-init.
+            assert not m2 and not u2, f"concept-init key mismatch: missing={m2[:4]} unexpected={u2[:4]}"
+            print(f"[init] loaded concept-pretrained backbone from {init_ckpt}")
         self.backbone = m
         self.head_only = head_only
         # freeze all; then (unless head_only) unfreeze last `unfreeze` blocks + final norm. head_only keeps the
@@ -228,6 +231,9 @@ def main():
     ap.add_argument("--out", default="phase3/cache/ft.pt")
     a = ap.parse_args()
     dev = device(); print(f"device={dev}")
+    if a.holdout == "none" and a.wise_ft >= 1.0 and not a.head_only:
+        print("WARNING: shipping PURE FT (--wise-ft 1.0, no OOD anchor). The recipe is --wise-ft 0.7 [--swad]; "
+              "a bare invocation ships the least-robust model.", flush=True)
 
     paths, labels, centers, extra_neg = load_split(a.train_csv, a.neg_list, a.neg_cap)
     if a.holdout != "none":
@@ -253,7 +259,12 @@ def main():
     print(f"sampler: {sampler.ppb} pos + {sampler.npb} neg / batch, {sampler.nbatches} batches, pos_weight={pos_w.item():.1f}")
     bce = nn.BCEWithLogitsLoss(pos_weight=pos_w)
     opt = torch.optim.AdamW(layerwise_param_groups(net, a.lr, a.lr_decay), weight_decay=a.wd)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs)
+    # SWAD averages the last-N epochs: if the cosine tail has annealed to ~0 those iterates are near-identical and
+    # the average is a no-op (== final epoch). Floor the tail at lr*0.1 (=1e-5, below every layerwise group's base
+    # LR so no group inverts) ONLY when --swad, so the averaging window actually explores the basin. Plain cosine->0
+    # otherwise. Whether the (now-functional) SWAD helps is decided by the paired LOCO gate.
+    eta_min = a.lr * 0.1 if a.swad else 0.0
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs, eta_min=eta_min)
     amp = dev == "cuda"; scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     def compute_loss(logits, y, tail):
@@ -289,14 +300,16 @@ def main():
         if vam.any():
             r, s = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
             ppv = r["ppv90"]
-            # AUROC/AUPRC are threshold-free & STABLE across epochs — trust them to read the trend;
-            # PPV@90R bounces on few positives. Selection stays on PPV (the leaderboard metric).
+            # SELECT on AUPRC, not max PPV@90R: taking the epoch-max of PPV@90R over ~49-78 held-out positives is
+            # selection-on-noise (its MDE dwarfs the margins) and it biases the SWAD-vs-best comparison. AUPRC is
+            # threshold-free and stable across epochs. PPV@90R stays a printed diagnostic. (nan-safe fallback to PPV.)
+            sel = r["auprc"] if not np.isnan(r["auprc"]) else ppv
             msg += (f"  LOCO-val({a.holdout}) PPV@90R={ppv:.4f} CI[{r['ci_lo']:.3f},{r['ci_hi']:.3f}]"
                     f" AUROC={r['auroc']:.3f} AUPRC={r['auprc']:.3f}")
-            if ppv > best:
-                best = ppv
-                torch.save({"model": net.state_dict(), "cfg": vars(a), "loco_ppv90": best}, a.out)
-                # persist the primary (best-epoch) model's held-out y/center/scores for the PAIRED gate (ev.gate).
+            if sel > best:
+                best = sel
+                torch.save({"model": net.state_dict(), "cfg": vars(a), "loco_auprc": best, "loco_ppv90": ppv}, a.out)
+                # persist the selected model's held-out y/center/scores for the PAIRED gate (ev.gate).
                 # Frame order is identical across runs (same csv + holdout + sequential loader) -> sA,sB align.
                 np.savez(a.out[:-3] + "_loco.npz", y=np.array(labels[vam]), c=np.array(centers[vam]), s=s)
                 msg += "  *saved*"
@@ -331,7 +344,7 @@ def main():
     if not vam.any() and not (a.swad and swad_out):     # ship: SWAD already wrote a.out; else write final net
         torch.save({"model": net.state_dict(), "cfg": vars(a)}, a.out)
         print(f"saved ship model -> {a.out}")
-    print(f"best LOCO-val PPV@90R = {best:.4f}")
+    print(f"best LOCO-val AUPRC (selection metric) = {best:.4f}")
 
     # WiSE-FT: interpolate the saved backbone toward the SSL init (robustness; pick alpha on inner val).
     # No-op under --head-only (the backbone never moved), so skip it. Applied to BOTH best-epoch and SWAD.
