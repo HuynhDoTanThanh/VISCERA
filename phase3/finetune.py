@@ -287,7 +287,7 @@ def main():
         sched.step()
         msg = f"ep{ep+1}/{a.epochs} loss={tot/len(dl):.4f}"
         if vam.any():
-            r, _ = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
+            r, s = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
             ppv = r["ppv90"]
             # AUROC/AUPRC are threshold-free & STABLE across epochs — trust them to read the trend;
             # PPV@90R bounces on few positives. Selection stays on PPV (the leaderboard metric).
@@ -296,6 +296,9 @@ def main():
             if ppv > best:
                 best = ppv
                 torch.save({"model": net.state_dict(), "cfg": vars(a), "loco_ppv90": best}, a.out)
+                # persist the primary (best-epoch) model's held-out y/center/scores for the PAIRED gate (ev.gate).
+                # Frame order is identical across runs (same csv + holdout + sequential loader) -> sA,sB align.
+                np.savez(a.out[:-3] + "_loco.npz", y=np.array(labels[vam]), c=np.array(centers[vam]), s=s)
                 msg += "  *saved*"
         print(msg, flush=True)
         if a.swad and ep >= a.epochs - a.swad_last_n:   # accumulate the flat tail of the trajectory
@@ -319,7 +322,9 @@ def main():
         print(f"SWAD: averaged last {swad_n} epochs -> {swad_out}")
         if vam.any():        # LOCO ablation: score SWAD on the held-out center vs the best-epoch model (a.out)
             net.load_state_dict(swad_state)
-            r, _ = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
+            r, s = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
+            # SWAD is the shippable model under --swad -> its held-out scores are what the paired gate should compare
+            np.savez(a.out[:-3] + "_loco.npz", y=np.array(labels[vam]), c=np.array(centers[vam]), s=s)
             print(f"SWAD LOCO-val({a.holdout}) PPV@90R={r['ppv90']:.4f} CI[{r['ci_lo']:.3f},{r['ci_hi']:.3f}] "
                   f"AUROC={r['auroc']:.3f} AUPRC={r['auprc']:.3f}  (compare to best-epoch above)")
 
