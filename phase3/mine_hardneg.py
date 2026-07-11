@@ -59,7 +59,56 @@ def main():
                     help="drop the top-scoring candidates (PU guard: the very top may be real positives, not FPs)")
     ap.add_argument("--exclude-dir", default="",
                     help="comma-sep out/<dir> to exclude (anti-leakage: hold the LOCO-val center's pool out of the mine)")
+    # ---- CTM: Concept-Confounded Tail Mining. Rank the unlabeled pool by a trust-weighted DIAGNOSTIC-concept
+    #      score D (the axis on which NDBE look-alikes confuse the model); emit the confounded band as hard negs.
+    #      Runs offline from concept_targets.npz alone (no images / GPU). ----
+    ap.add_argument("--concept-rank", default="",
+                    help="concept_targets.npz -> mine concept-confounded hard negatives by diagnostic-concept score D")
+    ap.add_argument("--concept-conf",
+                    default="whitish_focal_area,focal_erythema,color_heterogeneity,color_change_locality,mucosal_irregularity",
+                    help="SURFACE/COLOR confounder concepts (NDBE look-alike axis) — mine HIGH on these")
+    ap.add_argument("--concept-decisive",
+                    default="demarcation,nodularity,vascular_irregularity,focal_abnormal_vessels,depression_ulceration,"
+                            "surface_effacement,dilated_vessels",
+                    help="ARCHITECTURE/VASCULAR hallmark concepts (strongest neo signal, AUROC~0.90) — PU guard drops "
+                         "unlabeled frames HIGH on these (they are the likely unlabeled POSITIVES, not hard negatives)")
+    ap.add_argument("--concept-out", default="unl_conceptFP.txt")
     a = ap.parse_args()
+
+    if a.concept_rank:
+        # CTM: mine SURFACE-confounded but ARCHITECTURALLY-BLAND unlabeled frames as hard negatives. Concept-space
+        # alone can't cleanly separate confounded-neg from unlabeled-pos (positives score high on everything;
+        # measured contamination only 5.1%->3.7%), so the real lever is the DECISIVE-hallmark PU GUARD: drop
+        # unlabeled frames whose decisive score >= the labeled-positive median (= likely unlabeled positives).
+        # Deployable CTM intersects this with the model-FP mine (--score-with) on Colab; this offline pass is the
+        # PU-safe candidate set + interpretability. Runs from concept_targets.npz alone (no images/GPU).
+        os.makedirs(a.out_dir, exist_ok=True)
+        z = np.load(a.concept_rank, allow_pickle=True)
+        names = [str(x) for x in z["concept_names"]]; idx = {n: i for i, n in enumerate(names)}
+        val, trust, lab, paths = z["value"], z["trust"], z["label"], z["paths"]
+
+        def cscore(concepts):
+            di = [idx[n] for n in concepts if n in idx]; w = trust[:, di]
+            return (val[:, di] * w).sum(1) / np.clip(w.sum(1), 1e-6, None)
+
+        conf = cscore(a.concept_conf.split(","))             # surface confounder axis
+        decis = cscore(a.concept_decisive.split(","))        # decisive hallmarks (neo signal)
+        labi = lab >= 0
+        pos_decis_med = float(np.median(decis[labi][lab[labi] == 1])) if (lab == 1).any() else 1.0
+        unl = lab < 0
+        keep = unl & (decis < pos_decis_med)                 # PU guard: exclude likely unlabeled positives
+        Ck, Pk = conf[keep], paths[keep]
+        order = np.argsort(-Ck)                              # most surface-confounded first
+        sel = order[a.skip_top:a.skip_top + a.topn]
+        picked = Pk[sel]
+        outp = os.path.join(a.out_dir, os.path.basename(a.concept_out))
+        with open(outp, "w") as f:
+            f.write("\n".join(map(str, picked.tolist())) + ("\n" if len(picked) else ""))
+        print(f"CTM: {len(picked)} concept-confounded hard negatives -> {outp}")
+        if len(sel):
+            print(f"  PU guard kept {int(keep.sum()):,}/{int(unl.sum()):,} unlabeled (decisive<{pos_decis_med:.3f}=pos-median); "
+                  f"mined confounder {Ck[sel[0]]:.3f}..{Ck[sel[-1]]:.3f}, skip-top {a.skip_top}")
+        return
     os.makedirs(a.out_dir, exist_ok=True)
 
     rows = scan(a.label_root)
