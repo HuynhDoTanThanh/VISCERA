@@ -47,6 +47,18 @@ def main():
     ap.add_argument("--confneg-sample", type=int, default=30000)
     ap.add_argument("--suspicious-top", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=0)
+    # ---- model-in-the-loop (one-sided PU) mining: score the VLM-negative pool with the CURRENT model,
+    #      emit its top false-positives as hard negatives for the next fine-tune round ----
+    ap.add_argument("--score-with", default="",
+                    help="comma-sep fine-tuned .pt to score the pool with; emits unl_modelFP.txt (model's top FPs "
+                         "among VLM-negative frames = the hard negatives that decide PPV@90R). Skips the static writes.")
+    ap.add_argument("--pool", default="HARD_NEG_CANDIDATE,CONFIDENT_NEGATIVE",
+                    help="VLM decisions eligible to be mined as negatives (very-likely-negative buckets only)")
+    ap.add_argument("--topn", type=int, default=3000, help="how many model-FP hard negatives to emit")
+    ap.add_argument("--skip-top", type=int, default=200,
+                    help="drop the top-scoring candidates (PU guard: the very top may be real positives, not FPs)")
+    ap.add_argument("--exclude-dir", default="",
+                    help="comma-sep out/<dir> to exclude (anti-leakage: hold the LOCO-val center's pool out of the mine)")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
 
@@ -60,6 +72,29 @@ def main():
 
     from collections import Counter
     print("decision counts:", dict(Counter(dec.tolist())))
+
+    if a.score_with:
+        from phase3.infer import _score_finetuned
+        keep = np.isin(dec, [d.strip() for d in a.pool.split(",")])
+        cand = [p for p in img[keep].tolist() if os.path.exists(p)]
+        if a.exclude_dir:
+            ex = set(d.strip() for d in a.exclude_dir.split(","))
+            cand = [p for p in cand if p.split(os.sep)[-3] not in ex]   # out/<dir>/images/<name>
+        cand = np.array(cand)
+        print(f"scoring {len(cand)} VLM-negative candidates ({a.pool}) with {a.score_with} ...")
+        models = [m.strip() for m in a.score_with.split(",") if m.strip()]
+        sc = _score_finetuned(models, list(cand))
+        order = np.argsort(-sc)                                          # highest model score = hardest FP
+        sel = order[a.skip_top:a.skip_top + a.topn]
+        picked = cand[sel]
+        outp = os.path.join(a.out_dir, "unl_modelFP.txt")
+        with open(outp, "w") as f:
+            f.write("\n".join(picked.tolist()) + ("\n" if len(picked) else ""))
+        rng_lo = sc[order[a.skip_top]] if len(order) > a.skip_top else float("nan")
+        rng_hi = sc[sel[-1]] if len(sel) else float("nan")
+        print(f"  unl_modelFP.txt: {len(picked)} model-FP hard negatives "
+              f"(skipped top {a.skip_top} as PU guard; model-prob range {rng_lo:.3f}..{rng_hi:.3f})")
+        return
 
     rng = np.random.default_rng(a.seed)
     # only keep frames whose image actually exists on disk

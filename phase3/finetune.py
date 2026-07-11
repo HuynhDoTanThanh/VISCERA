@@ -134,13 +134,21 @@ class PosBalancedBatchSampler(torch.utils.data.Sampler):
 
 
 # ----------------------------------------------------------------- losses (90R-targeted)
-def pairwise_rank_loss(logits, y, margin=1.0):
-    """Encourage every positive to outrank every negative (batch-wise). Directly improves ranking = PPV."""
+def pairwise_rank_loss(logits, y, margin=1.0, ohem_k=0):
+    """Encourage every positive to outrank every negative (batch-wise). Directly improves ranking = PPV.
+
+    ohem_k>0 = TAIL-WEIGHTED MARGIN: for each positive keep only its k HARDEST negatives (highest-scoring
+    negatives = the pairs that actually sit at the 90R threshold). A uniform mean over all P*N pairs spends
+    most of its gradient on already-separated easy pairs; top-k concentrates the margin exactly where
+    PPV@90R is decided. No new params, no graph change."""
     pos, neg = logits[y == 1], logits[y == 0]
     if len(pos) == 0 or len(neg) == 0:
         return logits.sum() * 0.0
     diff = pos.unsqueeze(1) - neg.unsqueeze(0)          # (P, N)
-    return torch.nn.functional.softplus(margin - diff).mean()
+    loss = torch.nn.functional.softplus(margin - diff)  # (P, N) per-pair hinge
+    if ohem_k and ohem_k < loss.shape[1]:
+        loss = loss.topk(ohem_k, dim=1).values          # k hardest negatives per positive
+    return loss.mean()
 
 
 def soft_pauc90(logits, y, q=0.2):
@@ -210,6 +218,13 @@ def main():
     ap.add_argument("--loss", default="bce+rank+pauc", help="bce | rank | pauc | bce+rank+pauc")
     ap.add_argument("--warmup", type=int, default=2, help="epochs of pure BCE before adding tail terms")
     ap.add_argument("--lr-decay", type=float, default=0.75, help="layer-wise LR decay factor")
+    ap.add_argument("--ohem-k", type=int, default=0,
+                    help="tail-weighted margin: keep k hardest negatives per positive in the pairwise-rank loss "
+                         "(0=off=uniform mean; recipe ~= pos_per_batch, e.g. 8). Targets the 90R tail, no new params.")
+    ap.add_argument("--swad", action="store_true",
+                    help="SWAD: ship the running mean of weights over the last --swad-last-n epochs (flat-minima "
+                         "variance floor + cross-center robustness). Averaged model has the SAME graph as best-epoch.")
+    ap.add_argument("--swad-last-n", type=int, default=5, help="number of final epochs to average for SWAD")
     ap.add_argument("--out", default="phase3/cache/ft.pt")
     a = ap.parse_args()
     dev = device(); print(f"device={dev}")
@@ -247,11 +262,12 @@ def main():
         if "bce" in terms or not tail:
             L = L + bce(logits, y)
         if tail and "rank" in terms:
-            L = L + 0.5 * pairwise_rank_loss(logits, y)
+            L = L + 0.5 * pairwise_rank_loss(logits, y, ohem_k=a.ohem_k)
         if tail and "pauc" in terms:
             L = L + 0.5 * soft_pauc90(logits, y)
         return L
 
+    swad_sum, swad_n = None, 0           # SWAD: running sum of state_dict over the last-N epochs
     best = -1
     for ep in range(a.epochs):
         net.train(); tot = 0
@@ -282,21 +298,51 @@ def main():
                 torch.save({"model": net.state_dict(), "cfg": vars(a), "loco_ppv90": best}, a.out)
                 msg += "  *saved*"
         print(msg, flush=True)
-    if not vam.any():
+        if a.swad and ep >= a.epochs - a.swad_last_n:   # accumulate the flat tail of the trajectory
+            sd = net.state_dict()
+            if swad_sum is None:
+                swad_sum = {k: v.detach().float().cpu().clone() for k, v in sd.items() if v.is_floating_point()}
+            else:
+                for k in swad_sum:
+                    swad_sum[k] += sd[k].detach().float().cpu()
+            swad_n += 1
+
+    # ---- SWAD: build the averaged model (same graph; frozen params average to themselves) ----
+    swad_out = None
+    if a.swad and swad_sum is not None:
+        ref = net.state_dict()
+        swad_state = {k: v.clone() for k, v in ref.items()}
+        for k in swad_sum:
+            swad_state[k] = (swad_sum[k] / swad_n).to(ref[k].dtype)
+        swad_out = a.out if not vam.any() else a.out[:-3] + "_swad.pt"
+        torch.save({"model": swad_state, "cfg": vars(a), "swad_last_n": swad_n}, swad_out)
+        print(f"SWAD: averaged last {swad_n} epochs -> {swad_out}")
+        if vam.any():        # LOCO ablation: score SWAD on the held-out center vs the best-epoch model (a.out)
+            net.load_state_dict(swad_state)
+            r, _ = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
+            print(f"SWAD LOCO-val({a.holdout}) PPV@90R={r['ppv90']:.4f} CI[{r['ci_lo']:.3f},{r['ci_hi']:.3f}] "
+                  f"AUROC={r['auroc']:.3f} AUPRC={r['auprc']:.3f}  (compare to best-epoch above)")
+
+    if not vam.any() and not (a.swad and swad_out):     # ship: SWAD already wrote a.out; else write final net
         torch.save({"model": net.state_dict(), "cfg": vars(a)}, a.out)
         print(f"saved ship model -> {a.out}")
     print(f"best LOCO-val PPV@90R = {best:.4f}")
 
     # WiSE-FT: interpolate the saved backbone toward the SSL init (robustness; pick alpha on inner val).
-    # No-op under --head-only (the backbone never moved), so skip it.
-    if a.wise_ft < 1.0 and not a.head_only and os.path.exists(a.out):
-        ck = torch.load(a.out, map_location="cpu", weights_only=False); st = ck["model"]
+    # No-op under --head-only (the backbone never moved), so skip it. Applied to BOTH best-epoch and SWAD.
+    def apply_wise_ft(path):
+        if not (a.wise_ft < 1.0 and not a.head_only and path and os.path.exists(path)):
+            return
+        ck = torch.load(path, map_location="cpu", weights_only=False); st = ck["model"]
         for k, v in init_bb.items():
             bk = f"backbone.{k}"
             if bk in st and st[bk].shape == v.shape:
                 st[bk] = (a.wise_ft * st[bk].float() + (1 - a.wise_ft) * v.float()).to(st[bk].dtype)
-        ck["model"] = st; torch.save(ck, a.out)
-        print(f"applied WiSE-FT alpha={a.wise_ft} -> {a.out}")
+        ck["model"] = st; torch.save(ck, path)
+        print(f"applied WiSE-FT alpha={a.wise_ft} -> {path}")
+    apply_wise_ft(a.out)
+    if swad_out and swad_out != a.out:
+        apply_wise_ft(swad_out)
 
 
 if __name__ == "__main__":
