@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--confneg-sample", type=int, default=30000)
     ap.add_argument("--suspicious-top", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--manifest-only", action="store_true",
+                    help="only build unl_manifest.npz (paths+suspicion for the SEMI loss); skip all .txt bucket writes")
     # ---- model-in-the-loop (one-sided PU) mining: score the VLM-negative pool with the CURRENT model,
     #      emit its top false-positives as hard negatives for the next fine-tune round ----
     ap.add_argument("--score-with", default="",
@@ -121,6 +123,10 @@ def main():
 
     from collections import Counter
     print("decision counts:", dict(Counter(dec.tolist())))
+
+    if a.manifest_only:                      # SEMI only needs unl_manifest.npz -> skip the unused .txt bucket writes
+        print("manifest-only: wrote unl_manifest.npz, skipping .txt buckets")
+        return
 
     if a.score_with:
         from phase3.infer import _score_finetuned
