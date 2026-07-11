@@ -129,6 +129,33 @@ class FrameDS(torch.utils.data.Dataset):
         return x, float(self.labels[i])
 
 
+class UnlabeledDS(torch.utils.data.Dataset):
+    """VLM-scored unlabeled frames for SEMI-SUPERVISED training. Returns (weak_view, strong_view, vlm_suspicion):
+    weak = mild aug (EMA-teacher target), strong = endoscopy RandAugment (student input) — FixMatch/Mean-Teacher
+    consistency. The 168k-frame pool regularizes the model instead of memorizing the 127 positives (anti-overfit),
+    and the VLM suspicion gives a one-sided-PU confident-NEGATIVE signal (low suspicion = clearly normal mucosa)."""
+    def __init__(self, img_paths, susp, aug_config="rand-m6-mstd0.6-inc1"):
+        self.paths = list(img_paths); self.susp = np.asarray(susp, np.float32)
+        self.weak = T.Compose([T.RandomResizedCrop(IMG, scale=(0.7, 1.0)), T.RandomHorizontalFlip()])
+        from timm.data.auto_augment import rand_augment_transform
+        ENDO_OPS = ["AutoContrast", "Equalize", "Rotate", "ColorIncreasing", "ContrastIncreasing",
+                    "BrightnessIncreasing", "SharpnessIncreasing", "ShearX", "ShearY", "TranslateXRel", "TranslateYRel"]
+        ra = rand_augment_transform(aug_config, {"translate_const": int(IMG * 0.3), "img_mean": (124, 116, 104)},
+                                    transforms=ENDO_OPS)
+        self.strong = T.Compose([T.RandomResizedCrop(IMG, scale=(0.5, 1.0)),
+                                 T.RandomHorizontalFlip(), T.RandomVerticalFlip(), ra])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def _norm(self, im):
+        return (torch.from_numpy(np.asarray(im.resize((IMG, IMG)), np.float32).copy()).permute(2, 0, 1) / 255. - _MEAN) / _STD
+
+    def __getitem__(self, i):
+        im = Image.open(self.paths[i]).convert("RGB")
+        return self._norm(self.weak(im)), self._norm(self.strong(im)), float(self.susp[i])
+
+
 class PosBalancedBatchSampler(torch.utils.data.Sampler):
     """Each batch carries exactly `pos_per_batch` positives (oversampled) + negatives, so the soft-pAUC /
     pairwise-rank tail losses ALWAYS fire. Without this, at ~1.5% positive rate a shuffled batch holds <1
@@ -240,6 +267,18 @@ def main():
                     help="mild=exp1 baseline; strong=endoscopy-curated RandAugment (domain randomization -> synthesize "
                          "the acquisition diversity 2 centers can't provide; excludes signal-erasing Invert/Solarize/Posterize)")
     ap.add_argument("--aug-config", default="rand-m6-mstd0.6-inc1", help="timm RandAugment config for --aug strong")
+    # ---- semi-supervised over the VLM-scored unlabeled pool: Mean-Teacher consistency (anti-overfit) + one-sided-PU
+    #      confident-negative distillation (demotes the FP tail). Uses the 168k frames the labeled set can't. ----
+    ap.add_argument("--semi-manifest", default="",
+                    help="unl_manifest.npz (VLM-scored pool) -> enable semi-supervised loss. '' = off.")
+    ap.add_argument("--semi-n", type=int, default=20000, help="unlabeled frames to sample for the semi loss")
+    ap.add_argument("--semi-bs", type=int, default=48, help="unlabeled batch size for the semi loss")
+    ap.add_argument("--semi-weight", type=float, default=0.5, help="weight of the semi loss (ramped 0->1 over --semi-rampup)")
+    ap.add_argument("--semi-lo", type=float, default=0.15,
+                    help="VLM suspicion below this = confident-NEGATIVE pseudo-label (target 0). Positives NOT pseudo-"
+                         "labeled (high suspicion includes NDBE look-alikes) -> one-sided PU.")
+    ap.add_argument("--ema-decay", type=float, default=0.99, help="EMA teacher decay for the consistency target")
+    ap.add_argument("--semi-rampup", type=int, default=5, help="epochs to ramp the semi weight 0->1 after --warmup")
     ap.add_argument("--lr-decay", type=float, default=0.75, help="layer-wise LR decay factor")
     ap.add_argument("--ohem-k", type=int, default=0,
                     help="tail-weighted margin: keep k hardest negatives per positive in the pairwise-rank loss "
@@ -287,6 +326,26 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs, eta_min=eta_min)
     amp = dev == "cuda"; scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
+    # ---- semi-supervised setup: sample the VLM pool + build an EMA teacher (off unless --semi-manifest) ----
+    semi_dl, ema = None, None
+    if a.semi_manifest and os.path.exists(a.semi_manifest):
+        import copy
+        z = np.load(a.semi_manifest, allow_pickle=True)
+        up, us = z["img_path"], z["suspicion"]
+        ridx = np.random.default_rng(a.seed).choice(len(up), min(a.semi_n * 2, len(up)), replace=False)
+        up2, us2 = up[ridx], us[ridx]
+        keep = np.array([os.path.exists(p) for p in up2])          # check only the sample, not all 168k
+        up2, us2 = up2[keep][:a.semi_n], us2[keep][:a.semi_n]
+        uds = UnlabeledDS(up2, us2, a.aug_config)
+        semi_dl = torch.utils.data.DataLoader(uds, batch_size=a.semi_bs, shuffle=True, num_workers=4,
+                                              persistent_workers=True, drop_last=True)
+        ema = copy.deepcopy(net)
+        for p in ema.parameters():
+            p.requires_grad_(False)
+        ema.eval()
+        print(f"semi: {len(up2)} VLM frames | weight={a.semi_weight} ema={a.ema_decay} conf-neg<{a.semi_lo} "
+              f"rampup={a.semi_rampup}ep (consistency + one-sided-PU)")
+
     def compute_loss(logits, y, tail):
         terms = a.loss.split("+")
         L = logits.sum() * 0.0
@@ -299,21 +358,43 @@ def main():
         return L
 
     swad_sum, swad_n = None, 0           # SWAD: running sum of state_dict over the last-N epochs
+    semi_iter = iter(semi_dl) if semi_dl is not None else None
     best = -1
     for ep in range(a.epochs):
         net.train(); tot = 0
         if net.head_only:
             net.backbone.eval()         # frozen encoder -> deterministic features (no drop_path/dropout noise)
         tail = ep >= a.warmup           # warm-start on BCE, then add the 90R tail terms
+        semi_w = (min(1.0, max(0, ep - a.warmup + 1) / max(1, a.semi_rampup)) * a.semi_weight) if semi_dl is not None else 0.0
         for x, y in dl:
             x, y = x.to(dev), y.float().to(dev)   # cast float64->float32 on CPU BEFORE moving (MPS rejects float64)
             opt.zero_grad()
             with torch.autocast(device_type="cuda", enabled=amp):
                 loss = compute_loss(net(x), y, tail)
+                if semi_dl is not None and tail:
+                    try:
+                        xw, xs, susp = next(semi_iter)
+                    except StopIteration:
+                        semi_iter = iter(semi_dl); xw, xs, susp = next(semi_iter)
+                    xw, xs, susp = xw.to(dev), xs.to(dev), susp.to(dev)
+                    with torch.no_grad():
+                        pt = torch.sigmoid(ema(xw))                  # EMA-teacher prob on the WEAK view
+                    ls = net(xs); ps = torch.sigmoid(ls)             # student on the STRONG view
+                    semi = ((ps - pt) ** 2).mean()                   # Mean-Teacher consistency (label-free -> anti-overfit)
+                    neg = susp < a.semi_lo                           # one-sided PU: confident VLM negatives -> target 0
+                    if neg.any():
+                        semi = semi + nn.functional.binary_cross_entropy_with_logits(ls[neg], torch.zeros_like(ls[neg]))
+                    loss = loss + semi_w * semi
             if amp:
                 scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
             else:
                 loss.backward(); opt.step()
+            if ema is not None:                                      # update the EMA teacher after the student step
+                with torch.no_grad():
+                    for pe, psrc in zip(ema.parameters(), net.parameters()):
+                        pe.mul_(a.ema_decay).add_(psrc.detach(), alpha=1 - a.ema_decay)
+                    for be, bsrc in zip(ema.buffers(), net.buffers()):
+                        be.copy_(bsrc)
             tot += loss.item()
         sched.step()
         msg = f"ep{ep+1}/{a.epochs} loss={tot/len(dl):.4f}"
