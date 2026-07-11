@@ -266,3 +266,28 @@ All of §10–§13 are **local and free**; only the hidden-test eval is rate-lim
 | date | change | status |
 |---|---|---|
 | 2026-07-11 | `--swad`, `--ohem-k`, `mine_hardneg --score-with` shipped + unit-tested; notebook LOCO-gate + bundle ship cells | code in `main`; awaiting Colab LOCO-gate run before submit |
+
+## 16. Novelty & paper strategy — completing the solution as a publishable contribution
+
+**The hard truth first (or the paper dies in review).** Winning and novelty conflict on this metric. The *safe* win is the RARE25 recipe — a big decorrelated ensemble — which is **not a methodological contribution** (unpublishable as "novel method"). And because the metric is **measurement-dominated** (SD ≫ margins; §2, §7), **final placement is partly luck → a paper cannot claim "our novel method won" from the leaderboard row alone.** Non-negotiable integrity rule for every claim in the paper: *validated on LOCO paired-Δ AUROC/AUPRC, both directions, seed-averaged, with CIs, reported against the measurement noise floor — independent of final rank.* The leaderboard is corroboration, never proof. A reviewer will (correctly) reject any lift smaller than the MDE.
+
+**Where novelty must come from.** Anyone can bolt DINOv2 + an ensemble onto ImageNet. Our **only** defensible, non-reproducible asset is the **144k VLM-concept-scored frames + the concept-role taxonomy already coded** (`pretrain_concept.py`: discriminative core `full15`; acquisition/scope-style `ACQ_QUALITY`→detached AUX; `route_concepts(detach/main/grl/drop)`). *That is the novelty engine.* (Note the earlier retired verdict — "concept-supervised **pretraining of the backbone** is null vs SSL" — is **not** contradicted here: we retire concepts as a *representation spine* but use them as a *signal* for mining + invariance, which that verdict explicitly left alive. Different mechanism, honest continuity.)
+
+### The recommended spine — "Concept-guided operating-point robustness"
+Two novel, concept-driven, metric-aligned mechanisms, both grounded in existing code, both falsifiable on LOCO:
+
+**(A) Concept-Confounded Tail Mining (CTM).** *Claim:* the negatives sitting above τ_90R are not random — they are **concept-confounded** (they share *diagnostic* concepts — `vascular_irregularity`, `whitish_focal_area`, `border_sharpness` — with true neoplasia). *Novelty:* mine hard negatives in the **diagnostic-concept space**, not just model-score space — NDBE frames that maximally activate the FP-driving concepts — and add them as label-0. Interpretable ("we show *which concept* the model confuses and fix it"), metric-aligned (surface #2), and it *extends the score-only miner already shipped* (`mine_hardneg --score-with`) with a concept-ranking term. Ablation: CTM vs score-only mining vs random-neg — does concept-guided cut FPR@90R more?
+
+**(B) Concept-Mediated Center Invariance (CMI).** *Claim:* center shift is **mediated by acquisition concepts** (color, brightness, scope, blur/glare/exposure). *Novelty:* feature-adversarial DANN/GRL already **failed** here (2-center adversary learns a shortcut) — so instead enforce that the **diagnosis logit is invariant to interventions on the acquisition-concept subspace**: style-augmentation consistency (RandConv/color = a do-operation on acquisition concepts) **plus** a penalty that the diagnosis is uninformative about the *predicted* acquisition concepts. This is a **causal/concept-mediated** invariance, not a feature-statistical one — and it upgrades the existing `context_route detach` from "don't shape the trunk" to "actively make the decision counterfactually-invariant to scope style." Ablation: CMI vs detach-only vs GRL vs none — does it cut the held-out-center FPR@90R?
+
+Together: *"The false positives that cost PPV@90R on an unseen center are concept-confounded and acquisition-mediated; we use VLM-derived clinical concepts to mine them (CTM) and to make the decision invariant to them (CMI)."* That is a clean, novel, interpretable paper thesis that targets the exact metric and uses the exact asset no competitor has.
+
+### Secondary contributions (true, and they harden the paper)
+- **Operating-point-aware SSL (a mechanistic insight / mini negative-result):** confidence-filtered self-training optimizes the *easy* region while a high-recall metric is decided by the *hard tail* → naive FixMatch is an AUROC-mover and a PPV@90R non-mover; **one-sided PU + consistency** is the principled fix (§12). Publishable as a "why standard SSL misfires for operating-point metrics" result.
+- **Robust model selection under measurement-dominated challenge metrics (§7):** MDE for PPV@90R@1% at ~127 positives, lesion/group bootstrap, AUROC-selection > PPV-selection, LOCO-both-directions. A methods contribution reviewers respect; it *is* why we didn't chase the 0.65 mirage.
+
+### Paper skeleton (A = spine, B/C = support)
+Metric-as-objective (§10 FPR@90R identity) → CTM → CMI → operating-point SSL → decorrelation-gated ensemble → measurement protocol → LOCO ablations with CIs → leaderboard corroboration. Title direction: *"Concept-Guided Operating-Point Robustness for Cross-Center Barrett's Neoplasia Detection."*
+
+### What "completing the solution" means, concretely
+Week-1 ship stays the **graph-safe bundle** (SWAD+OHEM; §15) — that protects the leaderboard while the novel spine is built and LOCO-validated offline. Then fold in whichever concept mechanism clears its LOCO gate. **The novel spine is developed and gated locally; it only reaches a submission once its paired-Δ AUROC/AUPRC CI is clear of 0.** This keeps the win safe AND the paper honest.

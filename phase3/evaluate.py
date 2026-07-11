@@ -149,9 +149,27 @@ def bootstrap(y, s, center=None, target=0.9, prevalence=0.01, B=1000, seed=12345
                 _curve_samples=cp, _fixed_samples=fx)
 
 
+def _metric_on(yb, sb, target=0.9, mode="curve", thr=None):
+    """One metric value on one resample, dispatched by mode: curve=PPV@target(curve-point), fixed=PPV@thr,
+    auroc / auprc = threshold-free ranking (nan if a resample is single-class)."""
+    if mode == "curve":
+        return ppv_curvepoint(yb, sb, target)
+    if mode == "fixed":
+        return ppv_fixed(yb, sb, thr, target)[0]
+    if len(np.unique(yb)) < 2:
+        return np.nan
+    if mode == "auroc":
+        return roc_auc_score(yb, sb)
+    if mode == "auprc":
+        return average_precision_score(yb, sb)
+    raise ValueError(f"unknown mode {mode}")
+
+
 def paired_bootstrap(y, sA, sB, center=None, target=0.9, prevalence=0.01, B=1000, seed=12345,
                      mode="curve", thrA=None, thrB=None):
-    """Δ = metric(A) - metric(B) on SHARED resamples. Returns P(Δ>0), median Δ. The lever-acceptance test."""
+    """Δ = metric(A) - metric(B) on SHARED resamples. Returns P(Δ>0), median Δ, and the 95% Δ CI. The
+    lever-acceptance test. mode = curve | fixed | auroc | auprc (use auroc/auprc to accept levers — stable;
+    curve/PPV@90R is a noisy tie-breaker only)."""
     rng = np.random.default_rng(seed)
     pos = np.where(y == 1)[0]; neg = np.where(y == 0)[0]
     if center is None:
@@ -162,14 +180,49 @@ def paired_bootstrap(y, sA, sB, center=None, target=0.9, prevalence=0.01, B=1000
     for b in range(B):
         idx = _resample_idx(rng, pos, neg_by_center, npos, prevalence, mix)
         yb = y[idx]
-        if mode == "curve":
-            a = ppv_curvepoint(yb, sA[idx], target); bb = ppv_curvepoint(yb, sB[idx], target)
-        else:
-            a = ppv_fixed(yb, sA[idx], thrA, target)[0]; bb = ppv_fixed(yb, sB[idx], thrB, target)[0]
-        d[b] = a - bb
+        d[b] = _metric_on(yb, sA[idx], target, mode, thrA) - _metric_on(yb, sB[idx], target, mode, thrB)
     d = d[~np.isnan(d)]
     return dict(p_gt0=float((d > 0).mean()), median_delta=float(np.median(d)),
                 mean_delta=float(np.mean(d)), lo=float(np.percentile(d, 2.5)), hi=float(np.percentile(d, 97.5)), B=len(d))
+
+
+# ----------------------------------------------------------------- acceptance gate / noise floor (contribution C)
+def gate(y, sA, sB, center=None, metric="auroc", target=0.9, prevalence=0.01, B=2000, seed=12345):
+    """THE lever-acceptance gate. Is A reliably better than B on `metric`? Δ = metric(A) - metric(B) on shared
+    resamples; PASS = 95% Δ CI clear ABOVE 0, FAIL = clear below, else INCONCLUSIVE (= noise, do not ship).
+    Accept levers on metric='auroc'/'auprc' (stable at few positives); 'curve' (PPV@90R) is a tie-breaker only."""
+    r = paired_bootstrap(y, sA, sB, center, target, prevalence, B, seed, mode=metric)
+    verdict = "PASS" if r["lo"] > 0 else ("FAIL" if r["hi"] < 0 else "INCONCLUSIVE")
+    return dict(metric=metric, delta=r["median_delta"], lo=r["lo"], hi=r["hi"], p_gt0=r["p_gt0"],
+                verdict=verdict, B=r["B"])
+
+
+def mde(y, s, center=None, metric="curve", target=0.9, prevalence=0.01, B=2000, seed=12345):
+    """Minimum Detectable Effect = the noise floor of `metric` on THIS set. Returns the metric's bootstrap SD
+    and MDE=2*SD: a change smaller than MDE is NOT MEASURABLE here (fall back to AUROC/AUPRC). This is the
+    quantitative reason PPV@90R@1% at ~127 positives cannot rank configs — its MDE dwarfs the contest margins."""
+    rng = np.random.default_rng(seed)
+    pos = np.where(y == 1)[0]; neg = np.where(y == 0)[0]
+    if center is None:
+        center = np.zeros(len(y), dtype=int)
+    neg_by_center = {c: neg[center[neg] == c] for c in np.unique(center)}
+    mix = _center_mix(center, y); npos = len(pos)
+    vals = np.empty(B)
+    for b in range(B):
+        idx = _resample_idx(rng, pos, neg_by_center, npos, prevalence, mix)
+        vals[b] = _metric_on(y[idx], s[idx], target, metric)
+    vals = vals[~np.isnan(vals)]
+    sd = float(np.std(vals))
+    return dict(metric=metric, median=float(np.median(vals)), sd=sd, mde=2 * sd, B=len(vals))
+
+
+def seed_summary(y, score_list, metric="auroc", target=0.9):
+    """Seed-averaged metric: given a list of per-seed score arrays for the SAME y, report mean±sd across seeds
+    ('a win must not be one lucky init'). Point metric per seed (not bootstrap)."""
+    vals = [_metric_on(np.asarray(y), np.asarray(s), target, metric) for s in score_list]
+    vals = np.array([v for v in vals if not np.isnan(v)])
+    return dict(metric=metric, mean=float(np.mean(vals)), sd=float(np.std(vals)), n_seeds=int(len(vals)),
+                vals=[float(v) for v in vals])
 
 
 # ----------------------------------------------------------------- dedup / loaders
