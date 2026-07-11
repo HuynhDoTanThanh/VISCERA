@@ -71,15 +71,18 @@ class ConceptNet(nn.Module):
     """Backbone + 3 heads. main -> grad to trunk (the invariant clinical signal); center -> reversed grad
     (push center cues OUT); aux -> z.detach() (read alive context WITHOUT shaping the trunk)."""
 
-    def __init__(self, main_idx, center_idx, aux_idx, unfreeze=6):
+    def __init__(self, main_idx, center_idx, aux_idx, unfreeze=6, backbone="dinov3"):
         super().__init__()
-        m = timm.create_model("vit_base_patch14_reg4_dinov2", pretrained=False, img_size=IMG, num_classes=0)
-        teacher = torch.load(CKPT, map_location="cpu", weights_only=False)["teacher"]
-        bk = {k[len("backbone."):]: v for k, v in teacher.items() if k.startswith("backbone.")}
         from timm.models import vision_transformer as vit_mod
-        conv = vit_mod.checkpoint_filter_fn(bk, m); conv.pop("mask_token", None)
+        from phase3.finetune import BACKBONES
+        model_name, ckpt_path = BACKBONES[backbone]
+        m = timm.create_model(model_name, pretrained=False, img_size=IMG, num_classes=0)
+        sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if backbone == "dinov2":                                    # teacher-format checkpoint -> extract backbone.*
+            sd = {k[len("backbone."):]: v for k, v in sd["teacher"].items() if k.startswith("backbone.")}
+        conv = vit_mod.checkpoint_filter_fn(sd, m); conv.pop("mask_token", None)
         miss, unexp = m.load_state_dict(conv, strict=False)
-        assert not miss and not unexp, f"backbone mismatch {miss} {unexp}"
+        assert not miss and not unexp, f"backbone {backbone} mismatch: {list(miss)[:4]} {list(unexp)[:4]}"
         for p in m.parameters():
             p.requires_grad_(False)
         for i in range(max(0, len(m.blocks) - unfreeze), len(m.blocks)):
@@ -228,6 +231,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--targets", default="phase3/cache/concept_targets.npz")
     ap.add_argument("--out", default="phase3/cache/concept_encoder.pt")
+    ap.add_argument("--backbone", choices=["dinov2", "dinov3"], default="dinov3",
+                    help="dinov3 = ViT-B/16 (dinov3.pth) | dinov2 = ViT-B/14-reg (dinov2.pth). Must match Stage-2 --backbone.")
     ap.add_argument("--epochs", type=int, default=15); ap.add_argument("--bs", type=int, default=96)
     ap.add_argument("--unfreeze", type=int, default=6); ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=0.05); ap.add_argument("--grl", type=float, default=1.0)
@@ -278,7 +283,7 @@ def main():
     ds = ConceptDS(paths, value, sup, train=True)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.bs, shuffle=True, num_workers=a.workers,
                                      drop_last=True, persistent_workers=a.workers > 0)
-    net = ConceptNet(main_idx, center_idx, aux_idx, a.unfreeze).to(dev)
+    net = ConceptNet(main_idx, center_idx, aux_idx, a.unfreeze, backbone=a.backbone).to(dev)
     tp = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"trainable params={tp/1e6:.1f}M  l2sp={a.l2sp}")
     # L2-SP reference: snapshot the trainable backbone weights at SSL init (anchor to keep features)
