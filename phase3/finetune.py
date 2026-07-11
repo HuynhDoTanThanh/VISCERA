@@ -341,8 +341,8 @@ def main():
         keep = np.array([os.path.exists(p) for p in up2])          # check only the sample, not all 168k
         up2, us2 = up2[keep][:a.semi_n], us2[keep][:a.semi_n]
         uds = UnlabeledDS(up2, us2, a.aug_config)
-        semi_dl = torch.utils.data.DataLoader(uds, batch_size=a.semi_bs, shuffle=True, num_workers=4,
-                                              persistent_workers=True, drop_last=True)
+        semi_dl = torch.utils.data.DataLoader(uds, batch_size=a.semi_bs, shuffle=True, num_workers=8,
+                                              persistent_workers=True, drop_last=True, prefetch_factor=4)
         ema = copy.deepcopy(net)
         for p in ema.parameters():
             p.requires_grad_(False)
