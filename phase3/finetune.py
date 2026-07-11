@@ -90,9 +90,27 @@ class Net(nn.Module):
 
 # ----------------------------------------------------------------- data
 class FrameDS(torch.utils.data.Dataset):
-    def __init__(self, paths, labels, train=True):
+    def __init__(self, paths, labels, train=True, aug="mild", aug_config="rand-m6-mstd0.6-inc1"):
         self.paths, self.labels, self.train = paths, labels, train
-        if train:
+        if not train:
+            self.tf = T.Resize((IMG, IMG))                # eval: deterministic, NO aug (train/serve parity)
+        elif aug == "strong":
+            # Endoscopy-curated RandAugment (domain randomization): with only 2 centers we cannot LEARN cross-center
+            # invariance, so we SYNTHESIZE acquisition diversity. EXCLUDE Invert/Solarize/Posterize/SolarizeAdd —
+            # they invert/quantize exactly the mucosal-color + vascular cues that separate neo from NDBE (signal
+            # erasure). Keep geometric (scope framing/orientation) + photometric (scope/lighting nuisance) ops only.
+            from timm.data.auto_augment import rand_augment_transform
+            ENDO_OPS = ["AutoContrast", "Equalize", "Rotate", "ColorIncreasing", "ContrastIncreasing",
+                        "BrightnessIncreasing", "SharpnessIncreasing", "ShearX", "ShearY", "TranslateXRel", "TranslateYRel"]
+            ra = rand_augment_transform(aug_config, {"translate_const": int(IMG * 0.3), "img_mean": (124, 116, 104)},
+                                        transforms=ENDO_OPS)
+            self.tf = T.Compose([
+                T.RandomResizedCrop(IMG, scale=(0.5, 1.0), ratio=(0.8, 1.25)),   # wider framing variation than mild
+                T.RandomHorizontalFlip(), T.RandomVerticalFlip(),                # endoscopy has no canonical up
+                ra,                                                              # curated RandAugment (m6/mstd0.6)
+                T.RandomApply([T.GaussianBlur(5, (0.1, 1.5))], 0.2),
+            ])
+        else:  # mild (default) == the exp1 baseline augmentation, unchanged
             self.tf = T.Compose([
                 T.RandomResizedCrop(IMG, scale=(0.7, 1.0), ratio=(0.85, 1.18)),
                 T.RandomHorizontalFlip(),
@@ -100,8 +118,6 @@ class FrameDS(torch.utils.data.Dataset):
                 T.RandomApply([T.GaussianBlur(5, (0.1, 1.5))], 0.2),
                 T.RandomRotation(10),
             ])
-        else:
-            self.tf = T.Resize((IMG, IMG))
 
     def __len__(self):
         return len(self.paths)
@@ -220,6 +236,10 @@ def main():
                     help="WiSE-FT: final backbone = a*FT + (1-a)*init; 1.0=pure FT, <1 interpolates toward SSL init (robustness)")
     ap.add_argument("--loss", default="bce+rank+pauc", help="bce | rank | pauc | bce+rank+pauc")
     ap.add_argument("--warmup", type=int, default=2, help="epochs of pure BCE before adding tail terms")
+    ap.add_argument("--aug", choices=["mild", "strong"], default="mild",
+                    help="mild=exp1 baseline; strong=endoscopy-curated RandAugment (domain randomization -> synthesize "
+                         "the acquisition diversity 2 centers can't provide; excludes signal-erasing Invert/Solarize/Posterize)")
+    ap.add_argument("--aug-config", default="rand-m6-mstd0.6-inc1", help="timm RandAugment config for --aug strong")
     ap.add_argument("--lr-decay", type=float, default=0.75, help="layer-wise LR decay factor")
     ap.add_argument("--ohem-k", type=int, default=0,
                     help="tail-weighted margin: keep k hardest negatives per positive in the pairwise-rank loss "
@@ -251,7 +271,7 @@ def main():
     mode = "HEAD-ONLY (frozen encoder linear probe)" if a.head_only else f"unfreeze last {a.unfreeze} blocks"
     print(f"train frames={len(tp)} pos={int(np.sum(tl))} | {mode} | trainable params={ntrain/1e6:.3f}M | holdout={a.holdout}")
 
-    ds = FrameDS(tp, tl, train=True)
+    ds = FrameDS(tp, tl, train=True, aug=a.aug, aug_config=a.aug_config)
     sampler = PosBalancedBatchSampler(tl, a.bs, pos_per_batch=a.pos_per_batch, seed=a.seed)
     dl = torch.utils.data.DataLoader(ds, batch_sampler=sampler, num_workers=6, persistent_workers=True)
     # with a balanced sampler the in-batch neg/pos ratio is ~npb/ppb (mild), NOT the ~159 dataset ratio
