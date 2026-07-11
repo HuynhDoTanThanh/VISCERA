@@ -293,3 +293,21 @@ Metric-as-objective (§10 FPR@90R identity) → CTM → CMI → operating-point 
 
 ### What "completing the solution" means, concretely
 Week-1 ship stays the **graph-safe bundle** (SWAD+OHEM; §15) — that protects the leaderboard while the novel spine is built and LOCO-validated offline. Then fold in whichever concept mechanism clears its LOCO gate. **The novel spine is developed and gated locally; it only reaches a submission once its paired-Δ AUROC/AUPRC CI is clear of 0.** This keeps the win safe AND the paper honest.
+
+## 17. One-shot review — two adversarial workflows (2026-07-11)
+
+Two multi-agent reviews (14-agent container + 27-agent training) with per-finding verification. **No CRITICAL/HIGH; no training-breaking, checkpoint-corrupting, or container-crashing bugs.** The container was run end-to-end offline on the real TIFF -> valid output; architecture parity empirically confirmed (179==179 keys, 0 missing). Fixes applied:
+
+**Container review (5 confirmed; 3 fixed):**
+- [MED] Paired gate built but never called — `evaluate_center` returned scores that finetune.py discarded (`r,_`). -> finetune.py persists `{out}_loco.npz`; notebook calls `ev.gate()`. Decision is the paired test, not eyeballing.
+- [LOW] BICUBIC/BILINEAR train-serve skew -> `viscera_model.py` forced `Image.BILINEAR` to match FrameDS.
+- [LOW] uint16 truncation (`astype(uint8)` mod-256) -> rescale-by-max guard (no-op for the 8-bit example).
+- [LOW notes] Docker base/deps unpinned -> validate the *saved tar* (`docker load`), not a rebuild; PPV apples-to-oranges -> moot (decision is the AUROC/AUPRC paired gate).
+
+**Training review (16 confirmed: 3 MED, 13 LOW/PARTIAL; MED all fixed):**
+- [MED] SWAD was a silent no-op — cosine->0 left the SWAD window at ~1e-7 LR (average == final epoch). Confirmed the pre-registered hypothesis. -> `eta_min=lr*0.1` when `--swad`; the paired gate now decides if functional-SWAD helps.
+- [MED] LOCO selection on epoch-max PPV@90R = selection-on-noise + biased the SWAD-vs-best comparison -> select on **AUPRC** (stable); PPV kept as diagnostic.
+- [MED] Ship committed to concept-init (measured ~null) untested -> LOCO cell is now a **3-leg gate** (cbase/cbundle/sslbundle) testing BOTH *[levers] bundle-vs-baseline* AND *[encoder] concept-init-vs-raw-SSL*, with explicit FAIL->drop-lever / FAIL->drop-`--init` decisions.
+- [LOW, deferred to LOCO A/B] soft_pauc90 q=0.2 targets ~80R (defensible variance tradeoff); no LR warmup; no drop_path; mild aug / no FOV-mask randomization; wd on norms/bias; positive-oversampling coupled to `--neg-cap`; confneg 1:1 weight. All optional tuning levers gated on LOCO, not defects. Defensive: `--init` asserts loud; pure-FT ship warns.
+
+**Net:** the shipped graph is sound; the fixes make the *decision process* rigorous (real gate, stable selection, encoder tested) and repair the one inert lever (SWAD). Nothing blocks the submission; the LOCO gate now tells you which of {baseline, bundle} x {concept, SSL} to ship.
