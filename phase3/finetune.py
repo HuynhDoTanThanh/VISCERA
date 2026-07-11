@@ -279,6 +279,10 @@ def main():
                          "labeled (high suspicion includes NDBE look-alikes) -> one-sided PU.")
     ap.add_argument("--ema-decay", type=float, default=0.99, help="EMA teacher decay for the consistency target")
     ap.add_argument("--semi-rampup", type=int, default=5, help="epochs to ramp the semi weight 0->1 after --warmup")
+    ap.add_argument("--semi-steps", type=int, default=1,
+                    help="unlabeled batches per labeled step (grad-accumulated). >1 uses MORE of the pool per epoch "
+                         "with fresh strong-aug each, WITHOUT repeating the labeled set more. Coverage/epoch = "
+                         "26*semi_steps*semi_bs frames. e.g. 8 -> ~20k/epoch at semi_bs=96.")
     ap.add_argument("--lr-decay", type=float, default=0.75, help="layer-wise LR decay factor")
     ap.add_argument("--ohem-k", type=int, default=0,
                     help="tail-weighted margin: keep k hardest negatives per positive in the pairwise-rank loss "
@@ -370,32 +374,45 @@ def main():
             x, y = x.to(dev), y.float().to(dev)   # cast float64->float32 on CPU BEFORE moving (MPS rejects float64)
             opt.zero_grad()
             with torch.autocast(device_type="cuda", enabled=amp):
-                loss = compute_loss(net(x), y, tail)
-                if semi_dl is not None and tail:
+                sup = compute_loss(net(x), y, tail)                  # supervised (labeled) loss
+            if amp:
+                scaler.scale(sup).backward()
+            else:
+                sup.backward()
+            tot += sup.item()
+            # SEMI: run --semi-steps unlabeled batches per labeled step (grads ACCUMULATED into the same opt.step),
+            # so the semi loss sweeps MUCH more of the pool per epoch (fresh strong-aug each) WITHOUT repeating the
+            # labeled set more -> no extra overfitting. Coverage/epoch = nbatches * semi_steps * semi_bs frames.
+            if semi_dl is not None and tail and semi_w > 0:
+                for _ in range(a.semi_steps):
                     try:
                         xw, xs, susp = next(semi_iter)
                     except StopIteration:
                         semi_iter = iter(semi_dl); xw, xs, susp = next(semi_iter)
                     xw, xs, susp = xw.to(dev), xs.to(dev), susp.to(dev)
-                    with torch.no_grad():
-                        pt = torch.sigmoid(ema(xw))                  # EMA-teacher prob on the WEAK view
-                    ls = net(xs); ps = torch.sigmoid(ls)             # student on the STRONG view
-                    semi = ((ps - pt) ** 2).mean()                   # Mean-Teacher consistency (label-free -> anti-overfit)
-                    neg = susp < a.semi_lo                           # one-sided PU: confident VLM negatives -> target 0
-                    if neg.any():
-                        semi = semi + nn.functional.binary_cross_entropy_with_logits(ls[neg], torch.zeros_like(ls[neg]))
-                    loss = loss + semi_w * semi
+                    with torch.autocast(device_type="cuda", enabled=amp):
+                        with torch.no_grad():
+                            pt = torch.sigmoid(ema(xw))              # EMA-teacher prob on the WEAK view
+                        ls = net(xs); ps = torch.sigmoid(ls)         # student on the STRONG view
+                        semi = ((ps - pt) ** 2).mean()               # Mean-Teacher consistency (label-free -> anti-overfit)
+                        neg = susp < a.semi_lo                       # one-sided PU: confident VLM negatives -> target 0
+                        if neg.any():
+                            semi = semi + nn.functional.binary_cross_entropy_with_logits(ls[neg], torch.zeros_like(ls[neg]))
+                        semi = (semi_w * semi) / a.semi_steps        # average over the K accumulated unlabeled batches
+                    if amp:
+                        scaler.scale(semi).backward()
+                    else:
+                        semi.backward()
             if amp:
-                scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+                scaler.step(opt); scaler.update()
             else:
-                loss.backward(); opt.step()
+                opt.step()
             if ema is not None:                                      # update the EMA teacher after the student step
                 with torch.no_grad():
                     for pe, psrc in zip(ema.parameters(), net.parameters()):
                         pe.mul_(a.ema_decay).add_(psrc.detach(), alpha=1 - a.ema_decay)
                     for be, bsrc in zip(ema.buffers(), net.buffers()):
                         be.copy_(bsrc)
-            tot += loss.item()
         sched.step()
         msg = f"ep{ep+1}/{a.epochs} loss={tot/len(dl):.4f}"
         if vam.any():
