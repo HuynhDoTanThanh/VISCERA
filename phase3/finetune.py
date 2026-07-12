@@ -319,9 +319,12 @@ def main():
     ap.add_argument("--cg-head", action="store_true",
                     help="use gated attention-MIL pooling instead of mean-pool (the tail lever; ~0.2M params, "
                          "regularized by the SEMI 288k-pool consistency + entropy floor). Ship graph gains attn.* keys.")
-    ap.add_argument("--attn-entropy", type=float, default=0.02,
-                    help="entropy regularizer on the attention map (maximize H -> anti-collapse: forbids 1-hot "
-                         "attention that memorizes a single patch/center cue). Only used with --cg-head.")
+    ap.add_argument("--attn-entropy", type=float, default=0.1,
+                    help="weight of the ONE-SIDED attention-entropy FLOOR penalty: fires only when H < attn_floor*Hmax "
+                         "(anti-collapse / anti-1-hot). Above the floor the attention focuses freely on the lesion. --cg-head only.")
+    ap.add_argument("--attn-floor", type=float, default=0.5,
+                    help="entropy floor as a fraction of log(N_patches): penalize attention only when it drops below this "
+                         "(0.5 = may focus down to half of max entropy; lower = allow sharper attention).")
     ap.add_argument("--semi-steps", type=int, default=1,
                     help="unlabeled batches per labeled step (grad-accumulated). >1 uses MORE of the pool per epoch "
                          "with fresh strong-aug each, WITHOUT repeating the labeled set more. Coverage/epoch = "
@@ -421,8 +424,12 @@ def main():
                 if a.cg_head:
                     logit, attn = net(x, return_attn=True)
                     sup = compute_loss(logit, y, tail)
-                    ent = -(attn * (attn + 1e-8).log()).sum(1).mean()   # attention entropy (per image, mean)
-                    sup = sup - a.attn_entropy * ent                    # maximize H -> anti-collapse (anti-memorize)
+                    H = -(attn * (attn + 1e-8).log()).sum(1).mean()     # attention entropy (per image, mean)
+                    Hmax = float(np.log(attn.shape[1]))                 # log(N patches)
+                    # ONE-SIDED floor: penalize ONLY when H drops below attn_floor*Hmax (anti-collapse / anti-1-hot).
+                    # Above the floor the attention is FREE to focus on the lesion (the whole point of CG-AMIL);
+                    # the old '-lambda*H' pushed toward uniform and made cg-head degenerate to mean-pool.
+                    sup = sup + a.attn_entropy * torch.relu(a.attn_floor * Hmax - H)
                 else:
                     sup = compute_loss(net(x), y, tail)                 # supervised (labeled) loss
             if amp:
