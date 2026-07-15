@@ -1,6 +1,8 @@
 # RARE26 — Study Plan & Experiment Tracker
 
 > Living document. Competition metric = **PPV@90R at 1% prevalence (bootstrap median)** on a **hidden NEW-center** test; AUROC/AUPRC (95% CI) also reported. Deploy: offline `--network=none`, image-only, per-image / ~16-frame stack, **no test-batch stats, no train-mode BatchNorm in the shipped graph**. Trust the 5 metrics only. Track **AUROC/AUPRC** as the stable signal; PPV@90R is high-variance even on the official leaderboard.
+>
+> **📍 CURRENT STATE (2026-07-12): read §19 (the winning plan) + §18 (its diagnosis) FIRST.** Three real submissions scored: **exps/2 (AUROC 0.854) is our BEST**, exp1 0.845, exps/3 0.756. Diagnosed failure = **per-center score-shift** (not tail-ranking); added capacity overfits 2 centers. **§19 = the operative plan** (defend exps/2 floor → per-distribution robust-z score normalization + decorrelated ensemble + WiSE-FT freeze + color aug), derived from a 32-agent adversarial workflow + local grounding. §4–§17 are historical, **superseded by §18–§19 where they conflict.**
 
 ---
 
@@ -8,14 +10,24 @@
 
 | exp | config | **PPV@90R** | PPV CI | AUROC | AUPRC | note |
 |---|---|---|---|---|---|---|
-| **exp1** (hidden test) | DINOv2 ViT-B + [cls⊕patch_mean], 3-seed ship + 5-view TTA | **0.0181** | [0.0106, 0.0901] | 0.845 | 0.356 | our submission |
+| **exp1** (hidden test) | DINOv2 ViT-B + [cls⊕patch_mean], mild-aug, no-semi, 30ep, 3-seed + 5-TTA | **0.0181** | [0.0106, 0.0901] | 0.845 | 0.356 | prior best |
 | exp1 (RARE25 val) | same | 0.0109 | [0.0098, 0.0990] | 0.866 | 0.562 | |
+| **exps/2** (hidden test) | **DINOv2 mean-pool + SEMI + concept-init, 336, mild-aug, 12ep**, 3-seed + 5-TTA | **0.0177** | [0.0099, 0.1259] | **0.854** | **0.401** | **🏆 NEW BEST (AUROC +0.009 vs exp1, PPV tied)** |
+| exps/2 (RARE25 val) | same | 0.0129 | [0.0102, 0.1306] | **0.873** | 0.613 | **best on both eval sets** |
+| **exps/3** (hidden test) | DINOv3 + **CG-AMIL attention** + concept-init + semi + **448 + strong-aug + 30ep** | **0.0117** | [0.0086, 0.0515] | **0.756** | 0.300 | **⚠ REGRESSED −0.098 AUROC vs exps/2** |
+| exps/3 (RARE25 val) | same | 0.0111 | [0.0087, 0.0479] | 0.835 | 0.543 | regressed −0.038 vs exps/2 on SAME set |
 | **TOP-1 target** (hidden test) | (competitor) | **0.0271** | [0.0140, 0.1203] | 0.895 | 0.382 | **beat this** |
 | top-1 (RARE25 val) | (competitor) | 0.0385 | [0.0146, 0.3917] | 0.961 | 0.663 | big val ranking gap |
 
 Field: RARE25 winner ≈ **0.035** (~40-model decorrelated ensemble), field < 0.06.
 
-**Key strategic fact:** exp1 vs top-1 PPV@90R CIs overlap **~85%** → the score gap is **within noise**. The only *detectable* gap is **ranking (AUROC/AUPRC)**, where top-1 genuinely leads (val AUROC 0.961 vs 0.866). **So we win by maximizing AUROC/AUPRC + robustness, not by chasing a PPV@90R point.**
+**⚠ 2026-07-12 REALITY CHECK — 3 real submissions now scored (see §18/§19):** ranked by the STABLE AUROC signal: **exps/2 (0.854) > exp1 (0.845) ≫ exps/3 (0.756)** — consistent on BOTH eval sets. The **decisive lesson is ARCHITECTURE WEIGHT, not the semi/concept levers**:
+> - **exps/2 = exp1's SIMPLE arch (DINOv2 mean-pool @336) + semi + concept-init + SHORT (12ep)** → **best model** (AUROC +0.009 vs exp1, PPV tied). So **semi-consistency + concept-init + short training HELP on a light backbone.**
+> - **exps/3 = the SAME semi/concept + HEAVY arch (DINOv3 + attention-MIL + 448 + strong-aug + 30ep)** → **worst** (−0.098 AUROC). The heavy capacity overfit the 2 centers (val→test gap ≈4× exp1's).
+>
+> So §18's blanket "demote semi/concept" was too coarse: **the culprit is added CAPACITY/training-length that overfits 2 centers, not the semi/concept mechanisms** (which help when the arch stays light). **exps/2 is the new floor to defend and the base to build on.** Full winning plan in §19.
+
+**Key strategic fact (unchanged, now reinforced):** PPV@90R CIs overlap ~85% → score gaps are within noise; the only *detectable* signal is **AUROC/AUPRC**. exps/3 losing 0.09 AUROC is the real, above-noise regression. **We win by maximizing new-center AUROC + robustness — and, per §18, by REVERSING complexity, not adding it.**
 
 ## 2. Diagnosis (drives everything)
 
@@ -61,7 +73,7 @@ Multi-agent research (22 agents) across loss / OOD-attention / imbalance / margi
 
 ## 5. Disqualified / do-not-revisit
 
-- **Any pure calibration/temperature/Platt/isotonic** — rank-invariant NO-OP (PPV@90R invariant to monotone transforms). Platt in `ship.py` stays a reporting nicety, never a lever.
+- **Any pure calibration/temperature/Platt/isotonic applied GLOBALLY to one model's final scores** — rank-invariant NO-OP (PPV@90R invariant to a *global* monotone transform). Platt in `ship.py` stays a reporting nicety, never a lever. **⚠ CORRECTION (2026-07-12, §18):** this does NOT extend to **per-center / per-stack** normalization or **pre-ensemble per-member** recalibration — those are monotone *within a group* but **reorder across the pooled test** → NOT global monotone → **NOT no-ops.** Per-center score normalization is the diagnosed fix for score-shift and was the RARE25 winner's key trick. Promoted to a Tier-1 lever in §18.
 - **SOPA-s / one-way partial-AUC DRO (LibAUC)** — no cross-center mechanism; a smoothed DRO variant of the **already-active** `soft_pauc90` (same 90R objective). Covered.
 - **CVaR-over-positives (center-stratified)** — fails data scale (α→1–2 samples/batch on 127 pos); cross-center piece = 2-center GroupDRO vs unseen 3rd; center-adversarial already null (GRL/DANN).
 - **SOAP / AP-loss / Smooth-AP (AUPRC surrogate)** — no cross-center mechanism; misaligned with 90R; redundant with `pairwise_rank` + `soft_pauc90`.
@@ -103,7 +115,8 @@ The metric is noise-dominated (PPV@90R CIs overlap ~85%). Tighten the ruler BEFO
 
 | date | exp | change | seed(s) | git SHA | LOCO PPV@90R-worst [CI] | LOCO AUROC | LOCO AUPRC | Δ-CI clear of 0? | submitted? leaderboard PPV@90R [CI] | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 2026-07-05 | exp1 | baseline (ship 3-seed + 5-view TTA) | 0,1,2 | f89c89a | — | — | — | — | ✅ 0.0181 [0.0106, 0.0901] | AUROC 0.845, AUPRC 0.356; top-1 = 0.0271 |
+| 2026-07-05 | exp1 | baseline (ship 3-seed + 5-view TTA) | 0,1,2 | f89c89a | — | — | — | — | ✅ 0.0181 [0.0106, 0.0901] | AUROC 0.845, AUPRC 0.356; top-1 = 0.0271; **STILL BEST** |
+| 2026-07-12 | exps/3 | DINOv3 + CG-AMIL attn + concept-init + semi + 448 + strong-aug (30/15ep) | 0,1,2 | 5d2b2f7 | — | 0.756 | 0.300 | ❌ AUROC −0.089 vs exp1 | ✅ 0.0117 [0.0086, 0.0515] | **REGRESSED** on stable AUROC (both eval sets); val→test gap 4× exp1 = overfit. See §18. exps/2 (dinov2+semi@336) built+validated, not yet submitted. |
 
 ## 9b. Submission-budget strategy (1 submission / WEEK)
 
@@ -311,3 +324,248 @@ Two multi-agent reviews (14-agent container + 27-agent training) with per-findin
 - [LOW, deferred to LOCO A/B] soft_pauc90 q=0.2 targets ~80R (defensible variance tradeoff); no LR warmup; no drop_path; mild aug / no FOV-mask randomization; wd on norms/bias; positive-oversampling coupled to `--neg-cap`; confneg 1:1 weight. All optional tuning levers gated on LOCO, not defects. Defensive: `--init` asserts loud; pure-FT ship warns.
 
 **Net:** the shipped graph is sound; the fixes make the *decision process* rigorous (real gate, stable selection, encoder tested) and repair the one inert lever (SWAD). Nothing blocks the submission; the LOCO gate now tells you which of {baseline, bundle} x {concept, SSL} to ship.
+
+---
+
+# §18. REALITY CHECK & REVISED STRATEGY — 2026-07-12 (post first real result)
+
+> We shipped the fancy stack (exps/3) and got the **first honest new-center number**. It **regressed vs the simple exp1**. This section records the deep diagnosis, states plainly **what it falsifies in §4–§16**, and rewrites the plan around the **actual** failure mechanism (per-center score-shift), grounded in a fresh cross-center-DG SOTA sweep + the RARE25 winner's recipe. **This section supersedes the tail-lever agenda where they conflict.**
+
+## 18.1 The result — complexity REGRESSED the stable signal
+
+| model | fine-tuning intensity | RARE25-val AUROC | hidden AUROC | **val→test gap** |
+|---|---|---|---|---|
+| **exp1** (DINOv2, mean-pool, mild-aug, no semi) | light | 0.866 | **0.845** | **0.02** (generalizes) |
+| **exps/3** (DINOv3, CG-AMIL attn, 448, strong-aug, semi, concept, 30/15ep) | heavy | 0.835 | **0.756** | **0.08** (overfit ≈4×) |
+
+Every lever we added — attention-MIL pooling, DINOv3, 448, strong-aug, semi, concept-init, more epochs — **lowered new-center AUROC on both eval sets** and **quadrupled the generalization gap**. Not catastrophic (PPV CIs overlap), but the direction is consistent on the **stable** signal. **exp1 is still our best model.**
+
+**Context (not a disaster):** RARE25 2nd-place (MaxViT@384) collapsed **0.945→0.771** cross-center — the *same wall*. Our 0.756 sits right at that band. The winner's **0.92 AUROC / 0.035 PPV came from a 40-model ensemble + per-prevalence recalibration + color aug**, NOT a single clever model. We are not far off the achievable single-model ceiling; we are far off the **ensemble+recalibration** wrapper.
+
+## 18.2 Deep diagnosis — the mechanism (measured, not guessed)
+
+Ran feature probes on 619 val frames (seed0 fine-tuned features vs frozen DINOv3, sklearn):
+
+1. **Frozen DINOv3 linear-probe transfer c1→c2 = 0.776 ≈ hidden AUROC 0.756.** Fine-tuning on 2 centers bought **~zero** new-center gain over the raw backbone. The tuned in-sample transfer (0.978) and same-center val (0.99) are **mirage** — 2-center alignment that evaporates on center 3.
+2. **Representation is ~0.996 center-separable — identical for frozen (0.996) and fine-tuned.** The largest axis of feature variation is *which center*, not neoplasia. Intrinsic to DINOv3 on endoscopy (per-center light/scope/color), **not** caused by our training.
+3. **🔫 SCORE-SHIFT is the killer.** center_2 negatives score ~3.5× higher than center_1 (neg p95 0.050 vs 0.014; one c2 negative = 0.977). The 90R operating threshold (0.42) is tuned to the 2 training centers. **A new center brings its own higher negative baseline → its normal mucosa floods above threshold → FPR explodes → PPV → ~random 0.01.** This is exactly 0.0117.
+4. **LP-FT confirmed (Kumar 2022):** freezing beats fine-tuning here (frozen 0.776 > FT 0.756), and *lighter* FT (exp1) beats *heavier* FT (exps/3). Fine-tuning distorts the foundation features that carry cross-center generality.
+
+## 18.3 What this FALSIFIES / REVISES in the prior plan
+
+- **The §4–§16 "tail-lever" thesis is not wrong in theory but wrong in priority.** Attention-MIL (§11.2), semi (§12), concept-mining (§16), strong-aug, more epochs — as implemented — **added capacity that overfit 2 centers** and **do not attack the diagnosed gap** (per-center score-shift / acquisition-color). They lifted the mirage val, not the unseen center. **Demote all of them below the DG/recalibration levers.**
+- **2-center LOCO was too weak to catch this** (it rewarded the same 2-center alignment that fails on center 3). The honest compass is **frozen-transfer + val→test gap**, not LOCO PPV.
+- **§5 correction (done):** per-center / per-stack **score normalization** and **pre-ensemble recalibration** are NON-monotone across the pooled test → real levers, not no-ops. This is the single biggest missed lever and the winner's key trick.
+- **The premise "we win by halving FPR@90R via tail ranking" (§10) is incomplete:** at AUROC≈0.78 the FPR@90R is dominated by **cross-center calibration/score-shift**, not tail ranking. Fix the shift first; then rank.
+
+## 18.4 REVISED winning strategy — ranked by (new-center leverage × feasibility with 2 centers)
+
+Grounded in the diagnosis + a 6-bucket cross-center-DG SOTA sweep + the RARE25 winner's actual recipe. **This is the new Tier-1.**
+
+| # | Lever | Why it targets THE mechanism | Cost | Evidence |
+|---|---|---|---|---|
+| **1** | **Per-center / per-stack SCORE normalization + prevalence-affine recalibration** (robust-z or rank on the stack's scores before pooling; recalibrate each ensemble member pre-average) | **Directly cancels the score-shift** that floods FPs at 90R. Non-monotone across centers → real PPV@90R lever. **The winner's key trick.** | trivial, inference-only, offline-safe | diagnosis §18.2(3); IMSY winner |
+| **2** | **Acquisition-domain augmentation: FDA amplitude-swap (β≈0.005–0.01) + RandStainNA/LAB-HSV color randomization + white-balance/CLAHE jitter** — replace the geometric rand-m6 | Manufactures **"unseen centers"** from our 2 → attacks the 0.996 separability / the color axis that IS the domain gap. **Biggest OOD-AUROC lever with 2 sources.** Winner used targeted color aug. | retrain (aug only) | FDA (Yang 2020), RandStainNA (Shen 2022) |
+| **3** | **Freeze the backbone (linear-probe or LoRA) + WiSE-FT high-α** — stop distorting foundation features | Frozen 0.776 > FT 0.756; lighter-FT exp1 > heavier-FT exps/3. Preserve the OOD-general representation; adapt cheaply. **Winner used DINOv3-ViT-L LoRA (near-frozen).** | cheaper than full FT | LP-FT (Kumar 2022), WiSE-FT (Wortsman 2022) |
+| **4** | **Big decorrelated ensemble + SWAD + model soup** — dinov2(exp1) ⊕ dinov3 ⊕ GastroNet-style ⊕ seeds ⊕ aug-strength | The **proven winning wrapper** (40-model soup). Averaging decorrelated rankers + flat minima = variance reduction for the **noisy median** metric. Domain-count-agnostic (works at 2). | many cheap members | SWAD (Cha 2021); every RARE25 top team |
+| **5** | **Two-way pAUC / AUC-margin loss on the (linear) head; explore one-class/anomaly scoring on the 99.6%-separable normal manifold** | Optimizes the exact high-recall corner, not mean AUROC. One-class is **unexplored by the whole field** (report flags it) and fits our normal-manifold finding → novelty upside. | head-only retrain | pAUC-DRO (Zhu/Yang 2022); field gap |
+
+**Explicitly SKIP** (need >2 domains or are unstable/BN-dependent here): DANN/GRL (already null), Fishr, SagNet, RSC, CORAL (2-covariance = weak), vanilla Tent (LayerNorm ViT, entropy-collapse on 1-class stacks).
+
+## 18.5 IMMEDIATE ACTIONS
+
+1. **🚨 Resolve best-vs-last submission policy NOW.** If the leaderboard keeps your **LAST** submission, then submitting exps/3 (0.0117) **replaced** and **worsened** your standing vs exp1 (0.0181). **Re-submit exp1 (or exp1⊕exps/3 prob-ensemble) to restore the better score.** If it keeps BEST, exp1 stands and this is non-urgent. *This is a free, high-priority correction.*
+2. **Do NOT ship exps/2 or exps/3 as the final** unless it beats exp1 on frozen-transfer / val→test gap. exp1 is the floor to defend.
+3. **Cheapest first experiment = lever #1 (score normalization), inference-only, no retrain** — can be prototyped on the existing scores today; then #2 (color aug) as the next retrain.
+
+## 18.6 Revised paper thesis (the honest negative result is STRONGER)
+
+The original CTM/CMI "concept-guided tail mining" spine (§16) was **falsified by the real data** — concept/attention/semi machinery regressed OOD. The honest, defensible, and more novel thesis:
+
+> **"On cross-center Barrett's neoplasia detection, added model capacity overfits the few training centers and *lowers* unseen-center performance; a frozen-backbone linear-probe transfer predicts the leaderboard almost exactly (0.776≈0.756). The operative failure is not tail-ranking but **per-center score-shift**, which we quantify (negatives drift 3.5× across centers) and fix at inference with per-stack score normalization — recovering PPV@90R without retraining."**
+
+That is a clean measurement + diagnosis + targeted-fix paper, corroborated by the winner's recipe, and it uses the honest data instead of chasing a mirage. Secondary contributions from §16 that SURVIVE: the measurement-discipline protocol (§7) and the "why standard SSL misfires for operating-point metrics" negative result (§16 secondary).
+
+**Bottom line to win:** stop adding model complexity; **fix the score-shift (lever #1), simulate centers with color aug (lever #2), freeze the backbone (lever #3), wrap in a decorrelated ensemble (lever #4)** — and defend exp1 as the floor. The ceiling is ~0.035 (winner) at this prevalence; getting there is an **ensemble + recalibration** problem, not a novel-single-model problem.
+
+---
+
+# §19. THE WINNING PLAN — 2026-07-12 (post-3-submissions; 32-agent adversarial workflow + local grounding)
+
+> Derived by a multi-agent workflow: **4 independent winning strategies** (defend-&-recalibrate / domain-invariance / ensemble-maximalist / novelty) → **27 unique levers** → **adversarially verified (24 survived)** → synthesized, then **grounded in local experiments** on the 619-frame val. This is the operative plan; §18 is its diagnosis, §4–§16 are historical. **Base model = exps/2** (the new best; §1).
+
+## 19.1 Situation (honest)
+Three real submissions rank **exps/2 (AUROC 0.854) > exp1 (0.845) ≫ exps/3 (0.756)** on both eval sets. The cross-center wall is an **operating-point / score-shift** failure (§18.2), NOT a representation gap capacity can close (frozen-LP transfer 0.776 ≈ fine-tuned 0.756; added capacity *regressed* us). **The win is the RARE25 winner's recipe — decorrelated ensemble + per-member/per-distribution recalibration + acquisition-invariance — layered on a defended exps/2 floor, not a novel single model.** PPV@90R's CI spans ~6× the margins → select on **LOCO AUROC** (stable), treat PPV as a directional tie-breaker. Final rank has a real luck component; we maximize the bootstrap-**median** by cutting variance and de-flooding the tail.
+
+## 19.2 Empirical grounding (local, 619-frame val — SAME-CENTER, so deltas are mechanism-directional, absolutes are mirage)
+
+| transform (on exps/2 unless noted) | pool PPV@90R | pool AUROC | pool FPR@90R | read |
+|---|---|---|---|---|
+| exps/2 raw | 0.471 | 0.978 | 0.0102 | base |
+| **+ per-center robust-z norm** | **0.517** | 0.976 | **0.0085** | ✅ score-norm helps (−FPR) |
+| synthetic +0.15 center offset, RAW | 0.433 | 0.978 | 0.0119 | ⬇ score-shift degrades |
+| synthetic +0.15/0.30/0.45, **robust-z** | **0.517** | 0.976 | 0.0085 | ✅ **norm CANCELS the offset — invariant to shift** |
+| per-center **RANK** norm | 0.10 | 0.951 | 0.082 | ❌ rank-norm HARMFUL (confirmed 2×) |
+| **exps/2 ⊕ exps/3 prob-mean** | **0.842** | **0.992** | **0.0017** | ✅ decorrelated ensemble stacks strongly |
+| exps/2 ⊕ exps/3 rank-mean | 0.572 | 0.990 | 0.0068 | combo detail is noise-sensitive → LOCO decides |
+
+**Two levers empirically de-risked:** (1) **per-distribution robust-z score normalization** provably cancels an injected center-offset (the diagnosed killer); use robust-z, NEVER rank. (2) **Decorrelated ensemble** is a candidate gain (but see the LOCO correction below). *Caveat: same-center val — must re-confirm on LOCO before shipping.*
+
+### 19.2b — LOCO frozen-LP transfer: the HONEST compass (`phase3/loco_probe.py`, 2026-07-13)
+Fit a linear probe on ONE center's FROZEN features, test the OTHER (predicts the leaderboard: dinov3 frozen 0.776 ≈ exps/3 hidden 0.756):
+
+| frozen-LP config | c1→c2 AUROC | c2→c1 AUROC | mean | PPV@90R (boot-median, both dirs) |
+|---|---|---|---|---|
+| **DINOv2** | **0.910** | **0.949** | **0.93** | 0.032 / 0.043 |
+| DINOv3 | 0.776 | 0.895 | 0.835 | 0.015 / 0.034 |
+| dv2 ⊕ dv3 ensemble | 0.881 | 0.932 | 0.91 | 0.022 / 0.054 |
+
+**🎯 DECISIVE — DINOv2 features are far more center-invariant than DINOv3** (mean cross-center AUROC **0.93 vs 0.835**). This is the **root cause** of exps/2 > exps/3 and retro-predicts both leaderboard rows. **Corrections to the plan:**
+- **Drop DINOv3.** DINOv2 is the backbone for every future member. (Our entire exps/3 direction was the wrong backbone.)
+- **The dv2⊕dv3 ensemble HURTS** (0.93→0.91) — dinov3 drags. The earlier same-center val "ensemble helps" (§19.2) was a mirage. **The decorrelated ensemble must be DINOv2 × DINOv2** (frozen-LP ⊕ fine-tuned exps/2 ⊕ seeds/augs), **never dinov3.**
+- **Frozen-DINOv2 linear-probe is a top single config** (LOCO 0.91–0.95; max foundation preservation, Kumar LP-FT) — a prime standalone AND ensemble member. Exported to `phase3/cache/frozen_lp_dinov2.npz`.
+- Note the frozen-LP LOCO (c1↔c2, ~0.93) overestimates the true 3rd-center by ~0.08 (exps/2 hidden 0.854) — c1↔c2 is easier than an unseen 3rd center. It is a valid **relative** compass, not an absolute.
+
+## 19.3 Ranked levers — 24/27 survived adversarial verification
+
+| Tier | Lever | Mechanism | Fixes | Compute | Risk | Gate |
+|---|---|---|---|---|---|---|
+| **1** | **Per-distribution robust score alignment** (offline, in-container) | Subtract a robust **low quantile (p5–p20)** of the *pooled* new-center scores (its negative-floor proxy) before the 90R threshold — **not** per-16-frame median/rank (a stack can be all-negative) | score-shift | CPU/local | med | LOCO c1↔c2: FPR@90R↓, PPV median↑, **never-worse guardrail**; stress all-negative stacks |
+| **1** | **Decorrelated ensemble + per-member affine recalibration** | Blind prob-average of sane fixed members (DINOv2 exps/2 × frozen DINOv3-LP × seeds); per-member affine baked as constants before averaging | variance (metric is median) | CPU/local | low | LOCO ensemble AUROC ≥ best member; **fixed** decorrelation rule (Spearman<0.85), NO greedy argmin on 2 folds |
+| **1** | **Frozen/LoRA base + WiSE-FT high-α** | Head-only/LoRA on frozen backbone; interpolate FT weights toward SSL init (α~0.7, `finetune.py --wise-ft`) | foundation-feature distortion | Colab-cheap | low | α by paired LOCO ΔAUROC both dirs; never below frozen-LP floor |
+| **2** | **Acquisition-domain color aug** (FDA β~0.005–0.01 + RandStainNA/LAB-HSV + WB/CLAHE), **replacing** geometric rand-m6 | Synthesize unseen-center appearance from 2 centers | color-gap→score-shift | Colab-retrain | med | center-probe AUROC <0.90 **AND** LOCO AUROC↑; light-FT only |
+| **2** | **Third decorrelated family** (GastroNet/ResNet50 frozen features) | CNN inductive bias → rank-decorrelated errors (winner's pairing) | variance | Colab-cheap | med | admit only if ensemble LOCO AUROC↑ AND Spearman<0.9 |
+| **2** | **SWAD** dense weight averaging | flat-minima average over FT trajectory | val→test gap | Colab | low | SWAD vs last-ckpt LOCO AUROC |
+| **2** | **Semi-consistency on 144k pool, LIGHT arch only** | Mean-Teacher/one-sided-PU (as in exps/2, which it HELPED) — keep it on DINOv2 mean-pool, never on heavy arch | center-robustness | Colab | med | it already cleared: exps/2>exp1. Keep light; LOCO-gate any change |
+| **3** | **pAUC/AUC-margin head** (`soft_pauc90 q=0.2`, float32, built) | shapes the 90R corner on frozen features | tail-ranking (in-domain) | CPU | low | paired LOCO A/B beats BCE at matched AUROC |
+| **3** | **Mahalanobis/kNN-to-normal as an ENSEMBLE MEMBER only** | one-class score vs per-center negative manifold | decorrelation | CPU | high | LOCO ranks pos above benign outliers; kill on FP flooding |
+
+## 19.4 Explicitly REJECTED (falsified or unsafe)
+- **More model capacity / heavy arch** (DINOv3+attention+448+strong-aug+long-train) — overfits 2 centers, regressed us (exps/3). **Proven.**
+- **Raw one-class anomaly as the PRIMARY score** — on a new center *everything normal reads anomalous* → amplifies score-shift. Only viable as a decorrelated member.
+- **Per-center RANK normalization** — destroys the tail (grounding: 0.10). Use robust-z.
+- **Center-debias k-sweep as ensemble members** — all share the single 2-center axis (near-identical, no decorrelation).
+- **Concept-bottleneck representation** — PPV collapses to the wall (retired, §16 note).
+- **DANN / CORAL / Fishr / SagNet / vanilla-Tent** — null/unstable with 2 domains or BN-dependent.
+- **Global calibration as a PPV lever, same-center-val selection** — no-op / mirage (§5, §18).
+
+## 19.5 IMMEDIATE FREE ACTIONS (this week, no retrain)
+1. **Floor is secure** — exps/2 is both our **latest AND best** submission (0.0177 PPV / 0.854 AUROC). Whether the board keeps best or last, we sit at our best. **Rule: never submit anything that doesn't beat exps/2 on LOCO.**
+2. **Build the LOCO harness** (extend `phase3/evaluate.py`): c1→c2 & c2→c1 reporting AUROC, PPV@90R (bootstrap median+CI), FPR@90R, + a per-member **Spearman matrix**. The decision instrument for every lever.
+3. **Cache per-frame scores** for exps/2 (TTA) and a **frozen DINOv3 ViT-B linear-probe** on all labeled val, tagged by center/stack → all recalibration/ensemble experiments become instant CPU.
+4. **Prototype low-quantile per-distribution alignment + robust-z** on cached scores; LOCO-gate with the never-worse guardrail (grounding already shows +mechanism).
+5. **Build exps/2 ⊕ frozen-DINOv3-LP recalibrated prob-average ensemble.** (Grounding: ensemble is the biggest confirmed gain. Decide by LOCO whether the second member is the frozen-LP or exps/3 — the frozen-LP avoids exps/3's overfit; exps/3 helped on val but is weak on the real center.)
+
+## 19.6 Week-by-week calendar
+- **W1 (CPU, no submit):** actions 1–5. Ship candidate = exps/2 ⊕ frozen-DINOv3-LP + affine recal + low-quantile alignment **only if it beats exps/2 on BOTH LOCO directions**; else keep exps/2. Expected AUROC 0.854→~0.86, PPV median ~0.018→~0.022. Kill if either LOCO direction regresses.
+- **W2 (Colab):** WiSE-FT α-sweep + expand the frozen-probe bank (DINOv3, GastroNet features). Blind-average, fixed decorrelation rule, no grid argmin. Submit only if LOCO AUROC gain > fold-noise. Expected +0.005–0.015 AUROC, tighter CI.
+- **W3 (Colab):** color-aug light-FT member (FDA+RandStainNA, no rand-m6). Gate: center-probe <0.90 AND LOCO AUROC↑; kill if AUROC drops. Add as decorrelated member. Expected +0–0.02 (uncertain).
+- **W4:** add GastroNet/CNN member + SWAD if they clear the admission gate; finalize container (parity + `--network none`); pAUC head as a free A/B.
+
+## 19.7 Submission strategy
+~1/week, measurement-dominated. **Submit only when the LOCO AUROC gain exceeds the fold-noise band; PPV is a noisy tie-breaker, never a selector.** Every candidate beats the exps/2 LOCO floor on both directions or we ship exps/2 unchanged. Never spend a submission on a same-center-val improvement (mirage).
+
+## 19.8 Honest ceiling & paper
+Single-model cross-center AUROC is capacity-saturated ~0.77–0.85. Realistic pooled target ~0.85–0.88; PPV@90R median ~0.022–0.030, optimistic tail brushing the winner's 0.035. **0.02–0.035 is a genuinely good result; 0.06 is the field ceiling; 0.6 is impossible.** CI will still span ~[0.011, 0.07]. **Paper survives any leaderboard draw — "Recalibration beats representation under center shift":** foundation features are 99.6% center-separable and capacity-saturated (frozen-LP == fine-tuned; added capacity regresses); the PPV@90R failure is a per-center **negative score-shift**, not a ranking deficit (quantified by the neg-p95 gap + the synthetic offset→robust-z-recovery experiment); a cheap **offline per-distribution score alignment + per-member affine recalibration + decorrelated ensemble** closes most of the gap **without retraining**, under a LOCO+bootstrap selection discipline. Rigorous negative results (DANN, concept-bottleneck, one-class-as-primary, geometric aug, capacity, same-center mirage) are the second contribution.
+
+## 19.10 IMPLEMENTED (2026-07-13) — code shipped + the next winning train
+
+All Tier-1/2 levers are now coded, unit-tested, and gated. Backbone decision from §19.2b is baked into the recipe: **DINOv2, drop DINOv3.**
+
+**Code landed (`main`):**
+- `phase3/loco_probe.py` — the honest cross-center compass (frozen-LP LOCO c1↔c2, AUROC/PPV@90R/FPR@90R + bootstrap CI). Produced the decisive **dinov2 0.93 ≫ dinov3 0.835** result; exports `frozen_lp_dinov2.npz`.
+- `phase3/frozen_lp_member.py` — the **frozen-DINOv2 linear-probe member** (top LOCO config; max foundation preservation). Standalone scorer `score_frames()` + `refit()` on all labeled data → shippable `(mean,scale,coef,intercept)` npz. Usable as its own submission OR a decorrelated member for exps/2 (dinov2-FT ⊕ dinov2-frozen-LP; **never dinov3**).
+- `phase3/finetune.py` — **`--aug domain`** (§19 lever #2: `AcquisitionAug` = white-balance + HSV stain jitter + reference-free FDA amplitude perturbation + gamma; attacks the per-center color axis, NOT geometric rand-m6; also drives the semi strong-view for center-nuisance consistency) + **`--img`** flag (dinov2 recipe = 336).
+- `RARE25-Submission/model/viscera_model.py` — **§19 lever #1 `SCORE_ALIGN_Q`** (per-stack low-quantile de-flooring; monotone within a stack, cancels per-center offset across the pooled test; default OFF, A/B-ready; proven shift-invariant in grounding).
+
+**The next winning train (Colab GPU) — LOCO-GATE the domain-aug lever, then ship:**
+```bash
+# 1) LOCO GATE (honest): does color/FDA domain-aug beat the exps/2 recipe on the UNSEEN center? Both directions.
+for HO in center_2 center_1; do
+ for AUG in mild domain; do
+  python -m phase3.finetune --backbone dinov2 --img 336 --holdout $HO --epochs 12 --unfreeze 6 \
+    --wise-ft 0.7 --init concept_encoder.pt --aug $AUG \
+    --semi-manifest phase3/cache/unl_manifest.npz --semi-n 300000 --semi-bs 192 --semi-steps 10 \
+    --out loco_${AUG}_${HO}.pt   # prints LOCO AUROC/AUPRC on the held-out center
+ done
+done
+# ADOPT --aug domain ONLY if its held-out AUROC >= mild on BOTH holdouts (else keep mild = exps/2 recipe).
+
+# 2) SHIP (winning recipe): DINOv2 mean-pool @336 + [domain|mild per the gate] + light semi + WiSE-FT, 3 seeds
+for S in 0 1 2; do
+  python -m phase3.finetune --backbone dinov2 --img 336 --holdout none --epochs 12 --seed $S --unfreeze 6 \
+    --wise-ft 0.7 --init concept_encoder.pt --aug domain \
+    --semi-manifest phase3/cache/unl_manifest.npz --semi-n 300000 --semi-bs 192 --semi-steps 10 \
+    --out ship_dv2dom_seed$S.pt
+done
+# 3) FROZEN-LP member (top LOCO config; ensemble with the ships): refit on all labeled + drop into the container
+python -c "from phase3.frozen_lp_member import refit; import csv; \
+  L=lambda f:( [r['path'] for r in csv.DictReader(open(f)) if r.get('aug','orig')=='orig'], \
+               [int(r['label']) for r in csv.DictReader(open(f)) if r.get('aug','orig')=='orig']); \
+  tp,tl=L('dataset/train.csv'); vp,vl=L('dataset/val.csv'); \
+  refit('dinov2.pth', tp+vp, tl+vl, 'phase3/cache/frozen_lp_dinov2_full.npz')"
+```
+**Container A/B options** (each ONE submission, LOCO-gate first): (a) exps/2 as-is (current best); (b) exps/2 + `SCORE_ALIGN_Q=0.10` (de-flooding); (c) new dinov2+domain ships; (d) ships ⊕ frozen-DINOv2-LP. Ship whichever wins LOCO; never submit a same-center-val-only gain.
+
+## 19.9 What would actually beat the winner
+Their 0.035 = ~40 members + affine recalibration + color aug. We **cannot out-ensemble 40 models** with 2 centers + 127 positives. Our only lever with headroom past 0.035 is **per-distribution score alignment that generalizes to the true hidden center** — if the new center's negative floor is estimable from its own pooled test scores and subtracting it de-floods FPR@90R more cleanly than their per-prevalence affine did. That single offline, network-free, non-monotone transform — proven in grounding to be shift-invariant, and LOCO-gated to never regress below exps/2 — is the bet. Everything else defends the floor and shrinks variance so the noisy median lands high.
+
+---
+
+# §20. THE NOVEL SPINE — CRISP (Concept-Residualized Invariant-operating-point Scoring)
+
+> From a 17-agent research→ideate→adversarial-verify→synthesize workflow (2026-07-15). 5 novel methods invented, 4 survived; the adversarial pass **demoted the negative-tail-alignment idea (NTSA)** — its "minimal sufficient invariance" claim is false (recall=90% is set by the *positive* low-quantile too) — and selected **CRISP** as the spine because it is the only idea that is simultaneously **2-center-safe, offline/per-stack-safe, AND locally verifiable with a RANK-INDEPENDENT mechanism metric.** That last property is decisive under a measurement-dominated metric (CI ~6×, MDE > any plausible margin): **we can prove the mechanism fires even when PPV cannot resolve it.**
+
+## 20.1 The spine — CRISP
+**Mechanism.** Model the lesion logit as `s(x) = lesion(x) + f(nuisance(x)) + noise`, where `nuisance(x)` = the few acquisition/scope/border/overlay concepts that (a) shift across centers by construction and (b) are label-orthogonal on source. We already predict these **offline, per-image, from the frozen GastroNet-DINOv2 aux concept heads** (no VLM at deploy). On abundant **source NEGATIVES** (labeled negs + ~6k pool ≈ pure neg at 1% prevalence) fit `μ₀(n)=E[s|n,y=0]` and `σ₀(n)=SD[s|n,y=0]` (isotonic / 2-layer). Deploy the **Frisch–Waugh–Lovell residual** `r(x) = (s − μ₀(n̂(x))) / σ₀(n̂(x))`. When a new center pushes brightness/scope/border, `μ₀(n)` moves *with* the concept and subtracts the nuisance-explained lift **per frame**, so negatives stay centered while the nuisance-orthogonal lesion residual survives.
+
+**Why it wins (tie to FPR@90R).** The flood is negatives risen for a *nuisance* reason; CRISP subtracts a per-frame nuisance-predicted baseline → those negatives fall back below the recall-preserving threshold → **lower new-center FPR@90R → higher PPV@90R** at fixed recall. `r` is a per-frame, feature-dependent, **non-monotone** transform across the pooled test → a legitimate rank-metric lever (a global affine would be a no-op). Also variance-reduces the bootstrap-median (threshold no longer set by a stochastic nuisance tail).
+
+**Novelty.** Closest prior art: ComBat site-harmonization (discrete site, feature-level), double-ML/FWL residualization (never applied to a *detector score* for OOD), multicalibration. CRISP's new assembly: **source-only, score-level FWL residualization against *learned continuous interpretable nuisance concepts* for cross-center operating-point transfer, requiring ZERO target-center statistics** → provably cannot degenerate into the ruled-out per-center rank-norm, needs no 3rd-center samples. Not a concept *bottleneck* (representation untouched; concepts only estimate a baseline to subtract).
+
+**Honesty.** Expected PPV lift is **small-to-null** — FWL removes only the *concept-spanned fraction* of a 0.996-separable drift. **The paper's load-bearing claim is the MECHANISM, not the rank.**
+
+## 20.2 Support levers (compose with the spine)
+- **NTSA (training-time, default OFF `--neg-align-weight 0`)** — sliced-W2 alignment of the *upper* negative-logit quantiles across source centers. Shapes negatives to co-locate *before* scoring; CRISP residualizes the *remaining* drift at deploy. Ship as an ensemble member + secondary paper angle (reframed as "empirically dominant factor", NOT a sufficiency theorem).
+- **PANC-shift only** — per-stack low-quantile null-floor with EB-shrinkage toward the offline 144k anchor (cheap safe last-mile). **Drop the scale/affine mode** (= the ruled-out per-group rank-norm; ~16-frame σ adds variance).
+- **DeFLoRA-as-engineering** — frozen-GastroNet-DINOv2 LoRA-bank ensemble (r=8, M=8–16) + WiSE-FT + frozen-LP cross-family member → toward the winner's ~40-model decorrelated recipe. Keep the ensemble + **plain** de-floor; do NOT sell style-gradient decorrelation as validated novelty.
+
+## 20.3 Explicitly rejected (adversarial pass)
+- **COCTA** (concept-CAV feature transport) — un-gateable by 2-center LOCO (like MixStyle); orthogonality to the single c1–c2 axis gives no guarantee vs a 3rd center's new drift. *Non-extrapolation wall.*
+- **NTSA sufficiency theorem** — false (recall set by positive low-quantile too). Keep NTSA as an empirical support lever, drop the theorem.
+- **PANC affine/scale** — two-moment version of the ruled-out per-group rank-norm.
+- **MixStyle as a headline** — un-gateable (§19; validated slight-hurt on frozen-LOCO because single-center training can't mix cross-center).
+
+## 20.4 Validation — falsifiable, RANK-INDEPENDENT (the decisive property)
+Extend `phase3/loco_probe.py` (the compass that predicted the leaderboard):
+1. **Mechanism metric (headline, noise-free):** cross-center **negative-score drift reduction** — KS / mean-gap between held-out-center negative-`s` and source negative-`s`, **raw vs residualized `r`**, on BOTH LOCO legs. Claim = drift shrinks with recall preserved.
+2. **Synthetic-shift battery:** `--aug domain` (FDA/RandStainNA) moves nuisance concepts; raw floods (FPR@90R↑) while `r` holds. Report **threshold-transfer recall** (apply source 90R threshold to shifted set → should stay ≈0.90).
+3. **Recall tripwire + fallback-to-raw** if residualizing drops held-out recall (concept became label-correlated).
+4. **Paired bootstrap** on AUPRC/FPR@90R with `mde()`. **Kill criterion:** if drift-reduction doesn't clear MDE on both legs → CRISP ships as raw; NTSA/PANC-shift/DeFLoRA carry the submission.
+
+## 20.5 Implementation (our stack)
+- **k≈5–8 aux nuisance heads** on frozen features (reuse `pretrain_concept.py` + `build_concept_targets.py` VLM labels); select by low `|corr(concept,label)|` on source + high cross-center variance (`concept_audit.py`). Per-image, `--network none` safe.
+- **`phase3/nuisance_residual.py`** — fit `μ₀(n),σ₀(n)` on source negatives, save beside the `.pt`.
+- **`phase3/infer.py` / `viscera_model.py`** — after `s, n̂`, emit `r=(s−μ₀(n̂))/σ₀(n̂)`; per-stack pooling unchanged.
+- **`finetune.py`** — `--neg-align-weight/-qlo/-qhi/-Q` (NTSA, default 0) + `StratifiedCenterBatchSampler` + thread `center_id`; LoRA bank behind `--lora-rank/--lora-members`.
+- **Ship** — `--holdout none` both-center model, WiSE-FT 0.7, 3-seed × LoRA ensemble, residualize each member before pooling, ONE global threshold.
+
+## 20.6 The paper
+**Title:** *Partialling Out the Scanner: Concept-Residualized Score Calibration for Cross-Center Operating-Point Transfer in Rare-Lesion Detection.*
+**Thesis:** cross-center failure at a high-recall operating point is an *operating-point* failure from observed nuisance (acquisition/scope) covariates confounding the score — not a discrimination failure; partialling them out per-frame via an offline concept predictor yields a nuisance-orthogonal score whose 90R threshold transfers with **no target statistics**.
+**Contributions:** (1) CRISP — source-only score-level FWL residualization against learned nuisance concepts; (2) a **rank-independent mechanism protocol** (negative-drift KS + threshold-transfer recall under LOCO/synthetic-shift) for validating operating-point methods under a measurement-dominated metric; (3) **honest negative results:** feature-invariance (DANN/CORAL/COCTA) + per-group rank-norm are unsound/harmful at 2 centers; NTSA sufficiency is empirical not a theorem.
+**Key figure:** overlaid source vs new-center *negative*-score histograms, raw (flooding the 90R line) vs residualized (re-aligned), with threshold-transfer recall annotated.
+**Strongest objection → rebuttal.** *6 concepts can't span a 0.996-separable drift.* → we don't claim full cancellation; we quantify the *fraction* removed, show it clears MDE on drift-reduction with recall preserved, fit on abundant negatives (not 127 positives) → never the DANN 2-center overfit, never ships worse than raw.
+
+## 20.7 Honest expected outcome + fallback
+Hidden-test estimate **PPV@90R ≈ 0.018–0.025** (exps/2 0.0177 + ensemble/de-floor variance reduction; CRISP adds a small median lift + CI tightening); ceiling ~0.035. **The defensible deliverable is the mechanism ablation, not the rank.** **Fallback if CRISP fails its gate:** ship exps/2 recipe + WiSE-FT + LoRA-bank ensemble + plain per-stack de-floor + PANC-shift — all 2-center/offline/per-stack-safe — and publish CRISP as the negative-result contribution.
+
+## 20.8 CRISP TESTED → FAILED its gate; REFRAME to the 3 pillars (2026-07-15)
+Ran `phase3/crisp.py` (rank-independent mechanism test, both LOCO legs). **CRISP does NOT reduce cross-center negative-score drift** (KS 0.943→0.945, 0.893→0.909; transfer FPR@90R unchanged; target AUROC −0.02). **Why (concept audit):** only **2 of 14** nuisance concepts actually shift across centers (`overlay_graphics` center-shift 0.53, `black_border` 0.11); the rest are dead/near-constant. The detector score doesn't depend on overlay/border, so residualizing removes ~nothing of a 0.996-separable drift. **CRISP is falsified as a positive method** (kept as a negative-result contribution). This also confirms: **"cross-center transfer" is an indefensible framing at 2 centers.**
+
+**REFRAMED operative method (3 pillars — the honest, defensible frame):**
+1. **Semi-supervised** — Mean-Teacher + one-sided-PU on the 144k GastroNet-domain pool (measured win: exps/2 > exp1). Label-efficiency, not a center claim.
+2. **VLM-Concept Teaching** — Stage-1 (`pretrain_concept.py`) distills the 35 clinical concepts as dense supervision; **role-aware routing** = diagnostic→trunk, nuisance→**GRL** (adversarial suppression of the audit-proven center-cue concepts `overlay_graphics`/`black_border`). This IS the "OOD layer."
+3. **OOD generalization levers** — `--aug domain` (color/FDA), MixStyle (param-free), WiSE-FT 0.7. All train-time, ship graph unchanged.
+
+**Winning recipe (Colab-ready, `phase3/colab_full_pipeline.ipynb`, dinov2@448):** Stage-1 concept-teaching (GRL nuisance-suppression) → **gate cell (BUNDLE vs BASE on held-out center)** → Stage-2 ship `--backbone dinov2 --img 448 --init concept_encoder.pt --cg-head --aug domain --mixstyle --wise-ft 0.7 --semi-* --epochs 15`, 3 seeds → container. **Honest:** the measurable wins are dinov2 backbone + semi + (gated) color-aug + concept-teaching; MixStyle/attention are optional un-gateable/below-noise riders. Run the gate before shipping.

@@ -19,7 +19,7 @@ WORKERS="auto:1024"
 
 # Exclude list: dir names (basename) to skip for a quick pass. Space-separated.
 # Override at call time, e.g.:  EXCLUDE="dir3 dir7" scripts/run.sh
-EXCLUDE="${EXCLUDE:-0 1 10 11 12 13 14 15 16 17 18 19 2 20 21 22}"
+EXCLUDE="${EXCLUDE:-0 1 10 11 12 13 14 15 16 17 18 19 2 20 21 22 23 24 25 26 3 33 34 35 36 37 38 39 4}"
 
 # Process every unlabeled_data/<dir>. Resumable: cached votes are skipped, so re-running after more
 # data is downloaded only does the new frames.

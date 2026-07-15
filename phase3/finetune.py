@@ -67,14 +67,39 @@ class AttnPool(nn.Module):
         return (a.unsqueeze(-1) * p).sum(1), a               # (B, dim), (B, N)
 
 
+class MixStyle(nn.Module):
+    """MixStyle (Zhou et al., ICLR 2021) — PARAM-FREE domain-generalization layer, our main center-invariance
+    lever. Per-token feature statistics (mean/std over the patch axis) ARE the per-center acquisition
+    'style' (color/illumination/scope = the 0.996-separable axis, §18.2). MixStyle mixes those statistics
+    across the batch, synthesizing UNSEEN-center styles at the FEATURE level while preserving content
+    (the normalized tokens). Works at 2 domains (mixes within-batch); 0 params -> cannot overfit like the
+    exps/3 attention did. Train-ONLY -> identity at eval, so the ship graph stays per-image / no batch stats."""
+    def __init__(self, p=0.5, alpha=0.1, eps=1e-6):
+        super().__init__(); self.p = p; self.eps = eps
+        self.beta = torch.distributions.Beta(alpha, alpha)
+
+    def forward(self, x):                                    # x: (B, N, C) patch tokens
+        if not self.training or x.size(0) < 2 or torch.rand(1).item() > self.p:
+            return x
+        mu = x.mean(1, keepdim=True); sig = (x.var(1, keepdim=True) + self.eps).sqrt()
+        xn = (x - mu) / sig                                  # content (style-normalized)
+        lam = self.beta.sample((x.size(0), 1, 1)).to(x.device)
+        perm = torch.randperm(x.size(0), device=x.device)    # mix each sample's style with another's
+        mu_m = lam * mu + (1 - lam) * mu[perm]
+        sig_m = lam * sig + (1 - lam) * sig[perm]
+        return xn * sig_m + mu_m                             # re-style with the mixed statistics
+
+
 class Net(nn.Module):
     """DINOv2 ViT-B/14-reg backbone (last K blocks trainable) + [cls ⊕ pooled-patch] linear head.
     Pooling = mean (default) or gated attention-MIL (cg_head=True) that lifts a few-patch lesion (the tail lever).
+    Optional MixStyle (mixstyle=True) on the patch tokens for feature-level center-invariance.
 
     init_ckpt: optional concept-pretrained encoder (pretrain_concept.py output) to start from instead
     of the raw SSL teacher — this is Stage-2 of the concept-supervised pipeline.
     """
-    def __init__(self, unfreeze=4, init_ckpt=None, head_only=False, cg_head=False, backbone="dinov3"):
+    def __init__(self, unfreeze=4, init_ckpt=None, head_only=False, cg_head=False, backbone="dinov3",
+                 mixstyle=False, mixstyle_p=0.5, mixstyle_alpha=0.1):
         super().__init__()
         from timm.models import vision_transformer as vit_mod
         model_name, ckpt_path = BACKBONES[backbone]
@@ -109,10 +134,13 @@ class Net(nn.Module):
         self.head = nn.Sequential(nn.LayerNorm(2 * 768), nn.Linear(2 * 768, 1))
         self.cg_head = cg_head
         self.attn = AttnPool(768, 128) if cg_head else None   # ~0.2M params; only added key set vs mean-pool
+        self.mixstyle = MixStyle(mixstyle_p, mixstyle_alpha) if mixstyle else None   # 0 params; train-only
 
     def forward(self, x, return_attn=False):
         f = self.backbone.forward_features(x)            # (B, 1+4+N, 768)  N=576@336 / 1024@448
         patches = f[:, 5:]
+        if self.mixstyle is not None:                    # feature-level center-invariance (train-only, no-op at eval)
+            patches = self.mixstyle(patches)
         if self.cg_head:
             pooled, a = self.attn(patches)               # attention-weighted pool (lifts few-patch lesion)
         else:
@@ -122,6 +150,45 @@ class Net(nn.Module):
 
 
 # ----------------------------------------------------------------- data
+class AcquisitionAug:
+    """§19 lever #2 — reference-free ACQUISITION-DOMAIN randomization (PIL->PIL).
+    Attacks the per-center COLOR/illumination/scope axis that DINOv3 encodes as ~0.996 center-separability
+    (§18.2). With only 2 centers we cannot LEARN cross-center invariance, so we SYNTHESIZE unseen-center
+    appearance by randomizing what makes a center look like a center: white-balance, HSV stain statistics,
+    gamma/illumination, and the low-frequency Fourier amplitude (FDA, Yang 2020 — keep PHASE=anatomy, jitter
+    AMPLITUDE=style). Structure/vascular cues (phase + hue-preserving) are kept, so it does not erase signal."""
+    def __init__(self, p=0.6, fda_beta=0.012, fda_jit=0.4, hue=0.06, sat=0.30, val=0.25, wb=0.15, gamma=0.25):
+        self.p, self.fb, self.fj = p, fda_beta, fda_jit
+        self.hue, self.sat, self.val, self.wb, self.g = hue, sat, val, wb, gamma
+
+    def _fda(self, arr):                                     # arr HWC float32 [0,255]; jitter low-freq amplitude
+        H, W = arr.shape[:2]; b = max(1, int(self.fb * min(H, W)))
+        f = np.fft.fft2(arr, axes=(0, 1)); amp, pha = np.abs(f), np.angle(f)
+        s = np.random.uniform(1 - self.fj, 1 + self.fj)     # single reference-free amplitude scale on the low band
+        amp[:b, :b] *= s; amp[:b, -b:] *= s; amp[-b:, :b] *= s; amp[-b:, -b:] *= s
+        out = np.real(np.fft.ifft2(amp * np.exp(1j * pha), axes=(0, 1)))
+        return np.clip(out, 0, 255)
+
+    def __call__(self, im):
+        r = np.random.rand
+        if r() < self.p:                                    # white-balance: per-channel gain (scope/light temp)
+            arr = np.asarray(im.convert("RGB"), np.float32)
+            arr *= (1 + np.random.uniform(-self.wb, self.wb, 3))[None, None, :]
+            im = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        if r() < self.p:                                    # HSV stain-style jitter (hue/sat/val = center color stats)
+            h = np.asarray(im.convert("HSV"), np.float32)
+            h[..., 0] = (h[..., 0] + np.random.uniform(-self.hue, self.hue) * 255) % 255
+            h[..., 1] = np.clip(h[..., 1] * (1 + np.random.uniform(-self.sat, self.sat)), 0, 255)
+            h[..., 2] = np.clip(h[..., 2] * (1 + np.random.uniform(-self.val, self.val)), 0, 255)
+            im = Image.fromarray(h.astype(np.uint8), "HSV").convert("RGB")
+        if r() < self.p:                                    # FDA low-frequency amplitude perturbation
+            im = Image.fromarray(self._fda(np.asarray(im.convert("RGB"), np.float32)).astype(np.uint8))
+        if r() < self.p:                                    # gamma / illumination
+            g = 1 + np.random.uniform(-self.g, self.g)
+            im = Image.fromarray((((np.asarray(im, np.float32) / 255.) ** g) * 255).clip(0, 255).astype(np.uint8))
+        return im
+
+
 class FrameDS(torch.utils.data.Dataset):
     def __init__(self, paths, labels, train=True, aug="mild", aug_config="rand-m6-mstd0.6-inc1"):
         self.paths, self.labels, self.train = paths, labels, train
@@ -142,6 +209,17 @@ class FrameDS(torch.utils.data.Dataset):
                 T.RandomHorizontalFlip(), T.RandomVerticalFlip(),                # endoscopy has no canonical up
                 ra,                                                              # curated RandAugment (m6/mstd0.6)
                 T.RandomApply([T.GaussianBlur(5, (0.1, 1.5))], 0.2),
+            ])
+        elif aug == "domain":
+            # §19 lever #2: acquisition-domain randomization. LIGHT geometry (framing) + the STAR = color/FDA
+            # stain jitter (AcquisitionAug) that attacks the per-center color axis — NOT the geometric rand-m6
+            # that regressed exps/3. Keeps the light backbone; synthesizes unseen-center appearance.
+            self.tf = T.Compose([
+                T.RandomResizedCrop(IMG, scale=(0.7, 1.0), ratio=(0.85, 1.18)),
+                T.RandomHorizontalFlip(),
+                AcquisitionAug(),                          # white-balance + HSV + FDA + gamma
+                T.RandomApply([T.GaussianBlur(5, (0.1, 1.5))], 0.15),
+                T.RandomRotation(10),
             ])
         else:  # mild (default) == the exp1 baseline augmentation, unchanged
             self.tf = T.Compose([
@@ -167,16 +245,22 @@ class UnlabeledDS(torch.utils.data.Dataset):
     weak = mild aug (EMA-teacher target), strong = endoscopy RandAugment (student input) — FixMatch/Mean-Teacher
     consistency. The 168k-frame pool regularizes the model instead of memorizing the 127 positives (anti-overfit),
     and the VLM suspicion gives a one-sided-PU confident-NEGATIVE signal (low suspicion = clearly normal mucosa)."""
-    def __init__(self, img_paths, susp, aug_config="rand-m6-mstd0.6-inc1"):
+    def __init__(self, img_paths, susp, aug_config="rand-m6-mstd0.6-inc1", aug="strong"):
         self.paths = list(img_paths); self.susp = np.asarray(susp, np.float32)
         self.weak = T.Compose([T.RandomResizedCrop(IMG, scale=(0.7, 1.0)), T.RandomHorizontalFlip()])
-        from timm.data.auto_augment import rand_augment_transform
-        ENDO_OPS = ["AutoContrast", "Equalize", "Rotate", "ColorIncreasing", "ContrastIncreasing",
-                    "BrightnessIncreasing", "SharpnessIncreasing", "ShearX", "ShearY", "TranslateXRel", "TranslateYRel"]
-        ra = rand_augment_transform(aug_config, {"translate_const": int(IMG * 0.3), "img_mean": (124, 116, 104)},
-                                    transforms=ENDO_OPS)
-        self.strong = T.Compose([T.RandomResizedCrop(IMG, scale=(0.5, 1.0)),
-                                 T.RandomHorizontalFlip(), T.RandomVerticalFlip(), ra])
+        if aug == "domain":
+            # §19: the consistency STRONG view perturbs the acquisition-color axis -> the student learns to be
+            # invariant to exactly the per-center nuisance a NEW center introduces (center-robustness).
+            self.strong = T.Compose([T.RandomResizedCrop(IMG, scale=(0.5, 1.0)),
+                                     T.RandomHorizontalFlip(), T.RandomVerticalFlip(), AcquisitionAug()])
+        else:
+            from timm.data.auto_augment import rand_augment_transform
+            ENDO_OPS = ["AutoContrast", "Equalize", "Rotate", "ColorIncreasing", "ContrastIncreasing",
+                        "BrightnessIncreasing", "SharpnessIncreasing", "ShearX", "ShearY", "TranslateXRel", "TranslateYRel"]
+            ra = rand_augment_transform(aug_config, {"translate_const": int(IMG * 0.3), "img_mean": (124, 116, 104)},
+                                        transforms=ENDO_OPS)
+            self.strong = T.Compose([T.RandomResizedCrop(IMG, scale=(0.5, 1.0)),
+                                     T.RandomHorizontalFlip(), T.RandomVerticalFlip(), ra])
 
     def __len__(self):
         return len(self.paths)
@@ -279,6 +363,7 @@ def evaluate_center(net, paths, labels, centers, dev, bs=64):
 
 
 def main():
+    global IMG                               # --img overrides the module-level resolution used by Net/FrameDS
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-csv", default="dataset/train.csv")
     ap.add_argument("--holdout", default="center_2", help="center to hold out for LOCO val; 'none' = train on all (ship)")
@@ -296,9 +381,10 @@ def main():
                     help="WiSE-FT: final backbone = a*FT + (1-a)*init; 1.0=pure FT, <1 interpolates toward SSL init (robustness)")
     ap.add_argument("--loss", default="bce+rank+pauc", help="bce | rank | pauc | bce+rank+pauc")
     ap.add_argument("--warmup", type=int, default=2, help="epochs of pure BCE before adding tail terms")
-    ap.add_argument("--aug", choices=["mild", "strong"], default="mild",
-                    help="mild=exp1 baseline; strong=endoscopy-curated RandAugment (domain randomization -> synthesize "
-                         "the acquisition diversity 2 centers can't provide; excludes signal-erasing Invert/Solarize/Posterize)")
+    ap.add_argument("--aug", choices=["mild", "strong", "domain"], default="mild",
+                    help="mild=exp1 baseline; strong=geometric endoscopy RandAugment (regressed exps/3); "
+                         "domain=§19 acquisition-color randomization (white-balance+HSV+FDA+gamma) — attacks the "
+                         "per-center color axis, keeps the light backbone (the RECOMMENDED cross-center aug)")
     ap.add_argument("--aug-config", default="rand-m6-mstd0.6-inc1", help="timm RandAugment config for --aug strong")
     # ---- semi-supervised over the VLM-scored unlabeled pool: Mean-Teacher consistency (anti-overfit) + one-sided-PU
     #      confident-negative distillation (demotes the FP tail). Uses the 168k frames the labeled set can't. ----
@@ -318,7 +404,14 @@ def main():
                          "(Apache-2.0, dinov2.pth, the exp1 0.018 path). Both: 5 prefix + embed 768 -> same head.")
     ap.add_argument("--cg-head", action="store_true",
                     help="use gated attention-MIL pooling instead of mean-pool (the tail lever; ~0.2M params, "
-                         "regularized by the SEMI 288k-pool consistency + entropy floor). Ship graph gains attn.* keys.")
+                         "regularized by the SEMI 288k-pool consistency + entropy floor). Ship graph gains attn.* keys. "
+                         "Ablation (frozen GastroNet-DINOv2 LOCO): attn 0.943 > mean 0.929 — USE with a LIGHT/frozen "
+                         "backbone (low --unfreeze / --head-only); it only regressed in exps/3 when compounded with full-FT+448.")
+    ap.add_argument("--mixstyle", action="store_true",
+                    help="MixStyle (Zhou 2021) feature-stat mixing on patch tokens = PARAM-FREE center-invariance "
+                         "lever (synthesizes unseen-center styles at 2 domains). Train-only, no eval/graph change. RECOMMENDED.")
+    ap.add_argument("--mixstyle-p", type=float, default=0.5, help="prob of applying MixStyle per forward")
+    ap.add_argument("--mixstyle-alpha", type=float, default=0.1, help="Beta(a,a) for the MixStyle mixing coefficient")
     ap.add_argument("--attn-entropy", type=float, default=0.1,
                     help="weight of the ONE-SIDED attention-entropy FLOOR penalty: fires only when H < attn_floor*Hmax "
                          "(anti-collapse / anti-1-hot). Above the floor the attention focuses freely on the lesion. --cg-head only.")
@@ -338,7 +431,10 @@ def main():
                          "variance floor + cross-center robustness). Averaged model has the SAME graph as best-epoch.")
     ap.add_argument("--swad-last-n", type=int, default=5, help="number of final epochs to average for SWAD")
     ap.add_argument("--out", default="phase3/cache/ft.pt")
+    ap.add_argument("--img", type=int, default=IMG,
+                    help="input resolution. WINNING dinov2 recipe = 336 (exps/2); dinov3 = 448. Overrides the module default.")
     a = ap.parse_args()
+    IMG = a.img                              # override the module-level resolution used by Net/FrameDS
     a.img = IMG                              # stamp the training image size into cfg so the container reconstructs exactly
     dev = device(); print(f"device={dev} | backbone={a.backbone} | img={IMG} | cg_head={a.cg_head}")
     if a.holdout == "none" and a.wise_ft >= 1.0 and not a.head_only:
@@ -355,7 +451,8 @@ def main():
         tp += extra_neg; tl += [0] * len(extra_neg)
         print(f"+ {len(extra_neg)} unlabeled negatives")
     torch.manual_seed(a.seed); np.random.seed(a.seed)
-    net = Net(a.unfreeze, init_ckpt=a.init or None, head_only=a.head_only, cg_head=a.cg_head, backbone=a.backbone).to(dev)
+    net = Net(a.unfreeze, init_ckpt=a.init or None, head_only=a.head_only, cg_head=a.cg_head, backbone=a.backbone,
+              mixstyle=a.mixstyle, mixstyle_p=a.mixstyle_p, mixstyle_alpha=a.mixstyle_alpha).to(dev)
     init_bb = {k: v.detach().cpu().clone() for k, v in net.backbone.state_dict().items()}  # for WiSE-FT
     ntrain = sum(p.numel() for p in net.parameters() if p.requires_grad)
     mode = "HEAD-ONLY (frozen encoder linear probe)" if a.head_only else f"unfreeze last {a.unfreeze} blocks"
@@ -387,7 +484,7 @@ def main():
         up2, us2 = up[ridx], us[ridx]
         keep = np.array([os.path.exists(p) for p in up2])          # check only the sample, not all 168k
         up2, us2 = up2[keep][:a.semi_n], us2[keep][:a.semi_n]
-        uds = UnlabeledDS(up2, us2, a.aug_config)
+        uds = UnlabeledDS(up2, us2, a.aug_config, aug=a.aug)
         semi_dl = torch.utils.data.DataLoader(uds, batch_size=a.semi_bs, shuffle=True, num_workers=8,
                                               persistent_workers=True, drop_last=True, prefetch_factor=4)
         ema = copy.deepcopy(net)
