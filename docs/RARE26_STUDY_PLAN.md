@@ -569,3 +569,86 @@ Ran `phase3/crisp.py` (rank-independent mechanism test, both LOCO legs). **CRISP
 3. **OOD generalization levers** — `--aug domain` (color/FDA), MixStyle (param-free), WiSE-FT 0.7. All train-time, ship graph unchanged.
 
 **Winning recipe (Colab-ready, `phase3/colab_full_pipeline.ipynb`, dinov2@448):** Stage-1 concept-teaching (GRL nuisance-suppression) → **gate cell (BUNDLE vs BASE on held-out center)** → Stage-2 ship `--backbone dinov2 --img 448 --init concept_encoder.pt --cg-head --aug domain --mixstyle --wise-ft 0.7 --semi-* --epochs 15`, 3 seeds → container. **Honest:** the measurable wins are dinov2 backbone + semi + (gated) color-aug + concept-teaching; MixStyle/attention are optional un-gateable/below-noise riders. Run the gate before shipping.
+
+---
+
+# §21. STUDY TABLES — all methods, measured (for the paper)
+
+**Measurement legend (which is decisive):** 🟢 **LB** = real hidden new-center leaderboard (truth) · 🔵 **LOCO** = frozen-LP c1↔c2 transfer, the honest cross-center compass (predicted LB: dinov3 0.776≈0.756) · 🟡 **val** = same-center 619-frame val (MIRAGE, optimistic) · ⚪ **synth** = synthetic-shift / directional only. 31-pos val → fine-grained deltas <~0.03 AUROC are **below the noise floor**.
+
+### 21.1 Main configurations (the 3 real submissions)
+| exp | encoder | header | concept-pretrain | semi | aug / OOD | loss | ep | 🟢 **LB PPV@90R** | 🟢 **LB AUROC** | 🟢 AUPRC | RARE25-val AUROC |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| exp1 | GastroNet-DINOv2 ViT-B @336 | cls⊕mean | ✗ | ✗ | mild | bce+rank+pauc | 30 | 0.0181 | 0.845 | 0.356 | 0.866 |
+| **exps/2** | GastroNet-DINOv2 ViT-B @336 | cls⊕mean | ✓ init | ✓ MT+PU | mild | bce+rank+pauc | 12 | **0.0177** | **0.854** 🏆 | 0.401 | **0.873** |
+| exps/3 | DINOv3 ViT-B @448 | CG-AMIL attn | ✓ init | ✓ MT+PU | strong-geom | bce+rank+pauc | 30/15 | 0.0117 | 0.756 ⬇ | 0.300 | 0.835 |
+
+### 21.2 Encoder / backbone  — 🔵 LOCO cross-center AUROC (frozen linear-probe)
+| backbone | pretrain | c1→c2 | c2→c1 | **mean** | verdict |
+|---|---|---|---|---|---|
+| **GastroNet-DINOv2 ViT-B** | in-domain GI DINOv2 (5M) | 0.910 | 0.949 | **0.929** | ✅ **the backbone** |
+| DINOv3 ViT-B | generic (LVD) | 0.776 | 0.895 | 0.835 | ✗ −0.09; explains exps/3 loss |
+| DINOv2 ⊕ DINOv3 ensemble | — | 0.881 | 0.932 | 0.906 | dinov3 **drags** — don't mix |
+| GastroNet ResNet50 / ViT-L | — | — | — | — | not public (self-train) |
+| SurgMotion-L (V-JEPA2) | surgical video | — | — | — | gated + video/surgical mismatch — untested |
+
+### 21.3 Image resolution — 🔵 LOCO (frozen DINOv2, cls⊕mean)
+| res | c1→c2 | c2→c1 | mean | note |
+|---|---|---|---|---|
+| **336** | 0.910 | 0.949 | **0.929** | ✅ (GastroNet native) |
+| 448 | 0.869 | 0.966 | 0.917 | ~neutral (within noise); finer tokens for attn |
+
+### 21.4 Header / pooling — 🔵 LOCO (frozen DINOv2 @336)
+| pooling | c1→c2 | c2→c1 | mean | verdict |
+|---|---|---|---|---|
+| **cls ⊕ mean** | 0.910 | 0.949 | **0.929** | ✅ current |
+| mean only | 0.896 | 0.947 | 0.921 | ok |
+| cls ⊕ max | 0.907 | 0.926 | 0.917 | ok |
+| max only | 0.900 | 0.902 | 0.901 | − |
+| cls only | 0.895 | 0.868 | 0.881 | worst |
+| CG-AMIL attention-MIL | 0.913 | 0.973 | 0.943* | *noisy 0.89–0.94 across runs = **below noise floor**; helps on FROZEN backbone only, regressed in exps/3 (full-FT) |
+
+### 21.5 Concept-supervised pretraining (VLM-Concept Teaching)
+| variant | measured | result | verdict |
+|---|---|---|---|
+| none (exp1) | 🟢 LB | AUROC 0.845 | baseline |
+| concept-init + semi (exps/2) | 🟢 LB | 0.854 (+0.009) | ✅ but confounded with semi |
+| concept as **representation spine** | 🔵/prior | ~null vs SSL | retired |
+| **CRISP** (concept-residual OOD score) | 🔵 LOCO | neg-drift KS 0.943→0.945 (**no reduction**) | ❌ **FAILED** — only 2/14 nuisance concepts shift (overlay 0.53, border 0.11); don't span the 0.996 drift |
+| GRL center-adversarial (Stage-1) | 🟢 LB (prior) | null on 3rd center | 2-center shortcut; suppresses train-centers only |
+
+### 21.6 OOD layer / generalization
+| method | measured | result | verdict |
+|---|---|---|---|
+| WiSE-FT (α=0.7, weight-space) | 🟢 used | robustness anchor | ✅ keep (Kumar/Wortsman) |
+| color/FDA aug (`--aug domain`) | — | untested on LB | 🔵 **gateable** — run the gate |
+| MixStyle (feature-stat mixing) | 🔵 synth | 0.893→0.887 | ⚠ **un-gateable** (LOCO trains 1 center → can't mix); param-free rider |
+| per-stack score de-floor (`SCORE_ALIGN_Q`) | ⚪ synth | robust-z cancels injected offset; small on dinov2 | mechanism-proven, small |
+| per-center robust-z norm | 🟡 val | pooled PPV 0.471→0.517 | directional; **rank-norm HARMFUL (0.10)** |
+| CRISP concept-residual | 🔵 LOCO | failed (above) | ❌ |
+| DANN/CORAL/Fishr/Tent | prior | null / need >2 domains | ✗ rejected |
+
+### 21.7 Loss
+| loss | status | note |
+|---|---|---|
+| **BCE + pairwise-rank + soft-pAUC@90 (q=0.2)** | ✅ active | the tail objective |
+| OHEM tail-margin (`--ohem-k`) | coded, gated | top-k hardest negs |
+| logit-adjusted BCE | researched | agaldran's workhorse; untested |
+| generative/feature positive-synthesis | 🔵 LOCO | +0.020 AUPRC, +0.003 PPV@90R (jitter×3) = **weak-positive**, support lever |
+
+### 21.8 Semi-supervised loss (144k pool)
+| variant | measured | result | verdict |
+|---|---|---|---|
+| none (exp1) | 🟢 LB | AUROC 0.845 | baseline |
+| **Mean-Teacher + one-sided-PU** (exps/2, LIGHT arch) | 🟢 LB | 0.854 (**+0.009**) | ✅ **measured win** on light backbone |
+| same semi on HEAVY arch (exps/3) | 🟢 LB | 0.756 | regressed (confounded w/ dinov3+attn+448) |
+
+### 21.9 Post-hoc fusion (inference)
+| method | measured | result | verdict |
+|---|---|---|---|
+| 5-view TTA + 3-seed prob-ensemble | 🟢 shipped | — | ✅ baseline wrapper |
+| multi-scale TTA (448+384+512) | 🟡 val | tied at 1-FP; hurts c1 | ✗ (rank-invariant sweep) |
+| decorrelated backbone ensemble | 🟡 val / 🔵 LOCO | val-mirage lift; dinov3 drags on LOCO | needs a DECORRELATED strong member |
+| per-member affine recalibration | prior (winner) | — | untested; non-monotone in ensemble |
+
+**One-line summary for the paper:** the only **🟢 leaderboard-confirmed** wins are **GastroNet-DINOv2 backbone** + **semi-supervised (MT+PU) on a light architecture**; everything else is either below the 31-pos noise floor, un-gateable, or a tested-negative (CRISP, MixStyle-frozen, attention-under-full-FT, DANN). This *is* the paper's honest core: **in the 2-center / measurement-dominated regime, backbone-domain-match + label-efficient semi are what generalize; added capacity and feature/score-invariance tricks do not.**
