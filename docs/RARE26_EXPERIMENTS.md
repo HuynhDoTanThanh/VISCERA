@@ -76,8 +76,8 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 | WiSE-FT (weight-space) | post-hoc | ✅ | 🟢 used | anchor | ✅ keep |
 | color/FDA aug (`--aug domain`) | train-time | ✅ | 🟢 LB | in exp-4 bundle, no gain | ✗ no measurable LB win (confounded w/ @448+attn) |
 | MixStyle (feature-stat mixing) | train-time | ✅ | 🟢 LB | in exp-4 bundle, no gain | ✗ un-gateable rider; drop |
-| per-stack score de-floor (`SCORE_ALIGN_Q`) | post-hoc | ✅ | ⚪ synth | small on dinov2 | mechanism-proven, small |
-| per-center robust-z norm | post-hoc | ✅ | 🟡 val | 0.471→0.517 | directional; **rank-norm HARMFUL** |
+| per-stack/center score de-floor (`SCORE_ALIGN_Q`) | post-hoc | ✅ | 🟡 val | **no-op** on exp4 (0.748→0.748); floor gap 1e-4 | ✗ **mechanism-MISMATCHED** — floods are in the UPPER neg tail, de-floor only touches the low quantile |
+| per-center robust-z norm | post-hoc | ✅ | 🟡 val | exp4 0.748→**0.664** (hurts); prior 0.471→0.517 | ✗ **HARMFUL** on same-center (IQR-divide adds noise when centers align) |
 | DANN / CORAL / Fishr / Tent | train/post | ✅ | prior | null / need >2 domains | ✗ rejected |
 
 ### F · LOSS
@@ -112,8 +112,8 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 ## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after the D2F+ val run)
 | # | item | track | why | blocker |
 |---|---|---|---|---|
-| 1 | **Operating-point recalibration** — per-stack de-floor (`SCORE_ALIGN_Q`) + per-member affine→1% | post-hoc | AUROC 0.83 is fine, PPV 0.015 is the wall = **score-shift**, not ranking. This is the ONLY lever that targets the actual failure | flip flag + A/B on LOCO |
-| 2 | **Honest LOCO gate for D2F+** (both members score the SAME held-out frames) + **weighted** fusion | A ensemble | same-center val CANNOT judge the ensemble; equal-weight drags the tail | train ViT-LOCO legs, re-score val subset |
+| 1 | **Run the honest LOCO harness** (cells D2F-4a/4b) | bench | the ONLY bench that sees the true new-center shift; A/B's de-floor AND the weighted ensemble on one center-blind proxy | Colab (2 ViT-LOCO finetunes) |
+| 2 | **Re-designed operating-point lever** — per-center UPPER-tail norm / affine→1% (NOT low-q de-floor, §5) | post-hoc | de-floor is mechanism-mismatched (flood is upper neg tail); affine rescales to target FPR | needs #1 to validate |
 | 3 | Diverse **ViT-L** member (public DINOv2/v3-L, frozen-LP) | A ensemble | 2nd decorrelated member if CNN alone isn't enough | Colab train |
 | 4 | **logit-adjusted BCE** | loss | agaldran's robust workhorse for the operating point | small code |
 | 5 | Generative (diffusion) hard positives | B novelty | break 127-pos wall (winner didn't) | heavy |
@@ -130,10 +130,26 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 - **ConvNeXt-Large is not worth it.** CNN member LOCO dropped 0.932/0.976 (Tiny) → **0.909/0.965** (Large). A ~4× bigger frozen encoder made the head-only member *slightly worse* on the honest legs. **Revert to convnext_tiny.**
 - **Equal-weight D2F+ HURTS the tail.** On val, rank-averaging the strong ViT anchor with the weaker CNN dragged center_2 PPV@90R **0.396 → 0.048** (AUROC barely moved 0.976 → 0.959). PPV@90R lives entirely in the tail; splicing in a member with a noisier tail poisons the 90%-recall threshold even when average ranking is preserved. (val is a same-center mirage — but the *mechanism* is metric-real.)
 
-**Plan — target the operating point first, ensemble second:**
-1. **Operating-point recalibration is the priority.** Turn on per-stack de-floor (`SCORE_ALIGN_Q≈0.10` in `viscera_model.py`) + per-member affine recalibration to 1% prevalence. A/B it on the LOCO legs (does de-flooring the new center's score baseline lift PPV@90R without hurting AUROC?). This is the only lever that attacks score-shift.
-2. **Anchor stays simple** = exps/2 recipe (dinov2 ViT-B @336, cls⊕mean, concept + semi). Not the exp-4 @448/attention bundle (retired, 2× no gain).
-3. **Ensemble only if it survives an HONEST gate.** The val cell (18) can't judge it — both members must score the **same held-out frames** under LOCO. And fuse **weighted** (anchor ≫ CNN), not equal rank-average. Keep the CNN member (convnext_tiny) as a hedge only if the weighted ensemble beats the anchor on **both** LOCO legs.
-4. **Paper novelty stays orthogonal:** honest-negatives (CRISP fail, MixStyle/DANN null, the bundle's 2× no-gain, Large≈Tiny, equal-weight-ensemble-hurts-tail) + generative positives (#5).
+**Plan — the decisive experiment is the honest LOCO harness; the operating-point lever must be re-designed:**
+1. **de-floor is NOT the silver bullet (local exp, §5).** On exp4 the per-center floor gap is ~1e-4 and `SCORE_ALIGN_Q` de-floor is a literal **no-op** (0.748→0.748); robust-z **hurts** (→0.664). The per-center asymmetry that exists is in the **UPPER negative tail** (center_2 q99=0.101 vs center_1 0.038, 2.6×) — exactly what floods FPR@90R, and exactly what a low-quantile de-floor **cannot** touch. So the operating-point lever must target the **upper tail / threshold region** (per-center high-quantile normalization, or the winner's **affine recalibration to 1% prevalence**), not the floor.
+2. **Run the honest LOCO harness (notebook cells D2F-4a/4b)** — the only bench that sees the TRUE new-center shift (each frame scored center-blind). It A/B's de-floor AND sweeps the weighted ensemble on one pooled proxy. Same-center val (cell 18) and the local exp are same-center mirages; this is the decision-maker.
+3. **Anchor stays simple** = exps/2 recipe (dinov2 ViT-B @336, cls⊕mean, concept + semi). Not the exp-4 @448/attention bundle (retired, 2× no gain).
+4. **Ensemble only if it survives the LOCO gate**, fused **weighted** (anchor ≫ CNN, convnext_tiny), never equal rank-average, and only if it beats the anchor on **both** legs.
+5. **Paper novelty stays orthogonal:** honest-negatives (CRISP fail, MixStyle/DANN null, bundle's 2× no-gain, Large≈Tiny, equal-weight-hurts-tail, **de-floor mechanism-mismatch**) + generative positives (#5).
 
-**Bottom line:** four single-model tries + the first ensemble try all confirm the same thing — **ranking is solved (AUROC ~0.83), the operating point is not (PPV ~0.015).** Stop adding ranking capacity (bigger CNN, more members). The next move is **inference-time operating-point recalibration** (per-stack de-floor + affine→1%), gated on LOCO; the ConvNeXt-**Tiny** member returns only as a *weighted, LOCO-gated* hedge.
+**Bottom line:** ranking is solved (AUROC ~0.83), the operating point is not (PPV ~0.015). But the obvious fix — low-quantile de-floor — is mechanistically mismatched (§5: the flood is in the upper neg tail, not the floor). The decisive next step is the **honest LOCO harness (4a/4b)** to measure the true new-center shift and gate BOTH the (re-designed, upper-tail/affine) operating-point lever AND the weighted ensemble; ship the simple exps/2 anchor + whichever survives.
+
+---
+
+## 5. Local score-shift experiment (2026-07-18, exp4 weights, dataset/val orig, CPU)
+Scored the 619 orig val frames with the exp4 ship (1 seed, orig view) and probed the score-shift the operating-point levers assume. **Caveat: exp4 saw both centers → same-center regime; this diagnoses the MECHANISM, not the LB gap.**
+
+| finding | number | implication |
+|---|---|---|
+| per-center **negative floor** gap (median) | **0.0001** (q10 0.0002 vs 0.0003) | no low-end shift on same-center → de-floor has nothing to cancel |
+| per-center **upper neg tail** (q99) | center_1 **0.038** vs center_2 **0.101** (2.6×) | THIS is what floods FPR@90R; a low-quantile de-floor can't reach it |
+| pooled PPV@90R: raw → de-floor | 0.7481 → **0.7481** (no-op) | `SCORE_ALIGN_Q` mechanically inert here |
+| pooled PPV@90R: raw → robust-z | 0.7481 → **0.6644** (−0.084) | spread-normalization HARMS when centers align |
+| single-center de-floor | raw == de-floor (exactly) | confirms the monotonicity subtlety: de-floor is a no-op within one center; only acts across pooled centers |
+
+**Takeaway:** the low-quantile de-floor lever is aimed at the wrong part of the distribution. Redesign the operating-point lever toward the **upper negative tail** (per-center high-q normalization) or **affine→1% recalibration**, and validate it on the honest LOCO harness — not same-center val.
