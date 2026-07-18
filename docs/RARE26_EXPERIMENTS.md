@@ -101,36 +101,39 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 |---|---|---|---|---|
 | 5-view TTA + 3-seed prob-ensemble | ✅ | 🟢 shipped | — | ✅ baseline wrapper |
 | multi-scale TTA (448+384+512) | ✅ | 🟡 val | no help; hurts c1 | ✗ |
-| **D2F+ ViT ⊕ ConvNeXt-CNN** (rank-avg) | ✅ member | 🔵 LOCO | CNN member AUROC **0.932 / 0.976** (c2/c1 held out) | ✅ **STRONG diverse member found** — ship the ensemble next |
+| CNN member — ConvNeXt-**Tiny** head-only LP | ✅ member | 🔵 LOCO | AUROC **0.932 / 0.976** (c2/c1) | ✅ strong + decorrelated |
+| CNN member — ConvNeXt-**Large** head-only LP | ✅ member | 🔵 LOCO | AUROC **0.909 / 0.965** (c2/c1) | ✗ **no gain over Tiny** (worse, within noise) — revert to Tiny |
+| **D2F+ ViT ⊕ CNN equal rank-avg** | ✅ | 🟡 val | ens **drags** anchor: c2 PPV 0.396→**0.048**, AUROC 0.976→0.959 | ⚠ equal-weight HURTS the PPV@90R tail; val is a mirage → **needs LOCO gate + weighting** |
 | decorrelated multi-backbone (dinov2⊕dinov3) | ✅ | 🔵 LOCO | dinov3 drags 0.929→0.906 | ✗ (use CNN member instead) |
-| per-member affine recalibration (→1%) | ⬜ | — | — | NOT done (winner's trick) — **do it with D2F+** |
+| per-member affine recalibration (→1%) + per-stack de-floor | ⬜ | — | — | **the real operating-point lever — do this FIRST** |
 
 ---
 
-## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after exp-4)
+## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after the D2F+ val run)
 | # | item | track | why | blocker |
 |---|---|---|---|---|
-| 1 | **SHIP D2F+ ensemble** = exps/2 ViT anchor ⊕ ConvNeXt-CNN member, rank-avg | A ensemble | CNN member LOCO 0.932/0.976, decorrelated — the only lever with fresh evidence | **run cell 18 → gate → ship** |
-| 2 | **Per-member affine recalibration** (→1%) + per-stack de-floor | A ensemble | winner's operating-point trick; PPV@90R is an operating-point metric | none — pairs with #1 |
+| 1 | **Operating-point recalibration** — per-stack de-floor (`SCORE_ALIGN_Q`) + per-member affine→1% | post-hoc | AUROC 0.83 is fine, PPV 0.015 is the wall = **score-shift**, not ranking. This is the ONLY lever that targets the actual failure | flip flag + A/B on LOCO |
+| 2 | **Honest LOCO gate for D2F+** (both members score the SAME held-out frames) + **weighted** fusion | A ensemble | same-center val CANNOT judge the ensemble; equal-weight drags the tail | train ViT-LOCO legs, re-score val subset |
 | 3 | Diverse **ViT-L** member (public DINOv2/v3-L, frozen-LP) | A ensemble | 2nd decorrelated member if CNN alone isn't enough | Colab train |
 | 4 | **logit-adjusted BCE** | loss | agaldran's robust workhorse for the operating point | small code |
 | 5 | Generative (diffusion) hard positives | B novelty | break 127-pos wall (winner didn't) | heavy |
-| 6 | SurgMotion-L member | A | downloadable ViT-L | gated + V-JEPA2 |
 | ~~x~~ | ~~CG-AMIL / @448 / MixStyle / aug-domain bundle~~ | — | **retired** — 2× no LB gain (exps/3, exps/4) | — |
+| ~~x~~ | ~~ConvNeXt-**Large** member~~ | — | **retired** — no gain over Tiny (0.909/0.965 < 0.932/0.976) | — |
 
 ---
 
-## 4. THE BETTER SOLUTION (post-exp-4)
+## 4. THE BETTER SOLUTION (post-exp-4 + D2F+ val run)
 
-**Diagnosis:** four single-model submissions have plateaued at PPV ≈ 0.012–0.018 / AUROC ≈ 0.76–0.85, all within each other's noise floor. exp-4 proved that piling levers (@448, attention head, MixStyle, domain-aug) onto the winning backbone buys **nothing measurable**. The single-model well is dry; the wall is cross-center **operating-point** transfer, not representation.
+**Diagnosis — the bottleneck is the OPERATING POINT, not ranking.** Across every submission AUROC is healthy (0.83–0.85) while PPV@90R sits at 0.012–0.018. A model that *ranks* neoplasia well (AUROC 0.83) but scores PPV 0.015 is not a ranking failure — it is a **score-shift** failure: the 90%-recall threshold learned on the source centers lands in a high-FPR region on the new center (memory: score-shift is the killer). Levers that only improve ranking (bigger backbone, attention head, a 2nd ensemble member) **cannot** move an operating-point metric much — and the D2F+ val run shows this directly.
 
-**Plan — stop tuning one model, build a de-correlated ensemble at the operating point:**
-1. **ViT anchor = exps/2 recipe** (dinov2 ViT-B @336, cls⊕mean, concept-init + semi, mild aug). Proven 0.854/0.0177. **Revert the exp-4 complexity** — it's the anchor, keep it simple.
-2. **CNN member = ConvNeXt (now convnext_large) head-only LP**, concept-pretrained on the 144k pool. LOCO AUROC **0.932 / 0.976** — strong AND makes different cross-center mistakes (local texture vs patch-token style). This is the winner's ResNet50⊕ViT lever.
-3. **Fuse = rank-average** (cancels per-family center bias, protects the tail vs a miscalibrated member). Notebook cells 15–18 (`D2F+`).
-4. **Recalibrate to the operating point** = per-member affine recalibration → 1% prevalence + per-stack de-floor (`SCORE_ALIGN_Q`). PPV@90R is an operating-point score, so calibration is a first-class lever, not an afterthought.
-5. **Gate before ship:** the D2F+ ensemble must beat **EACH** member on the **center_2 LOCO leg** (the honest new-center proxy). If it doesn't, ship the stronger single member — do not ship the ensemble on faith.
+**What the two new runs proved:**
+- **ConvNeXt-Large is not worth it.** CNN member LOCO dropped 0.932/0.976 (Tiny) → **0.909/0.965** (Large). A ~4× bigger frozen encoder made the head-only member *slightly worse* on the honest legs. **Revert to convnext_tiny.**
+- **Equal-weight D2F+ HURTS the tail.** On val, rank-averaging the strong ViT anchor with the weaker CNN dragged center_2 PPV@90R **0.396 → 0.048** (AUROC barely moved 0.976 → 0.959). PPV@90R lives entirely in the tail; splicing in a member with a noisier tail poisons the 90%-recall threshold even when average ranking is preserved. (val is a same-center mirage — but the *mechanism* is metric-real.)
 
-**Paper novelty stays orthogonal:** the honest-negative results (CRISP failing, MixStyle/DANN null, the bundle's 2× no-gain) + generative positives (#5) are the story; the ensemble is the rank.
+**Plan — target the operating point first, ensemble second:**
+1. **Operating-point recalibration is the priority.** Turn on per-stack de-floor (`SCORE_ALIGN_Q≈0.10` in `viscera_model.py`) + per-member affine recalibration to 1% prevalence. A/B it on the LOCO legs (does de-flooring the new center's score baseline lift PPV@90R without hurting AUROC?). This is the only lever that attacks score-shift.
+2. **Anchor stays simple** = exps/2 recipe (dinov2 ViT-B @336, cls⊕mean, concept + semi). Not the exp-4 @448/attention bundle (retired, 2× no gain).
+3. **Ensemble only if it survives an HONEST gate.** The val cell (18) can't judge it — both members must score the **same held-out frames** under LOCO. And fuse **weighted** (anchor ≫ CNN), not equal rank-average. Keep the CNN member (convnext_tiny) as a hedge only if the weighted ensemble beats the anchor on **both** LOCO legs.
+4. **Paper novelty stays orthogonal:** honest-negatives (CRISP fail, MixStyle/DANN null, the bundle's 2× no-gain, Large≈Tiny, equal-weight-ensemble-hurts-tail) + generative positives (#5).
 
-**Bottom line:** the single-model curve is flat (exp-4 confirms it). The one lever with **new** evidence is the **decorrelated ConvNeXt member (LOCO 0.932/0.976)** → the next submission is the **D2F+ ensemble + operating-point recalibration**, anchored on the *simple* exps/2 ViT, not the exp-4 bundle.
+**Bottom line:** four single-model tries + the first ensemble try all confirm the same thing — **ranking is solved (AUROC ~0.83), the operating point is not (PPV ~0.015).** Stop adding ranking capacity (bigger CNN, more members). The next move is **inference-time operating-point recalibration** (per-stack de-floor + affine→1%), gated on LOCO; the ConvNeXt-**Tiny** member returns only as a *weighted, LOCO-gated* hedge.
