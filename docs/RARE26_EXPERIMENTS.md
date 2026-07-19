@@ -112,12 +112,11 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 ## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after the D2F+ val run)
 | # | item | track | why | blocker |
 |---|---|---|---|---|
-| 1 | **FEWER EPOCHS / operating-point-aware early-stop** for the SHIP | train-time | LOCO shows PPV@90R peaks at ep1 and decays to ep5 while AUROC is flat (§6) — the 15-ep ship overshoots the PPV peak; the ship has no LOCO to early-stop on | epochs sweep, or select ship epoch from LOCO |
-| 2 | **Run the honest LOCO harness** (cells D2F-4a/4b) | bench | the ONLY bench that sees the true new-center shift; A/B's de-floor AND the weighted ensemble on one center-blind proxy | Colab (2 ViT-LOCO finetunes) |
-| 3 | **Re-designed operating-point lever** — per-center UPPER-tail norm / affine→1% (NOT low-q de-floor, §5) | post-hoc | de-floor is mechanism-mismatched (flood is upper neg tail); affine rescales to target FPR | needs harness to validate |
-| 4 | Diverse **ViT-L** member (public DINOv2/v3-L, frozen-LP) | A ensemble | 2nd decorrelated member if CNN alone isn't enough | Colab train |
-| 5 | **logit-adjusted BCE** | loss | agaldran's robust workhorse for the operating point | small code |
-| 6 | Generative (diffusion) hard positives | B novelty | break 127-pos wall (winner didn't) | heavy |
+| 1 | **Run the honest LOCO harness to completion** (cells D2F-4a/4b, both legs @448) | bench | the ONLY bench that sees the true new-center shift; A/B's de-floor AND the weighted ensemble on one center-blind proxy | Colab (2 ViT-LOCO finetunes) |
+| 2 | **Re-designed operating-point lever** — per-center UPPER-tail norm / affine→1% (NOT low-q de-floor, §5) | post-hoc | de-floor is mechanism-mismatched (flood is upper neg tail); affine rescales to target FPR | needs harness to validate |
+| 3 | Diverse **ViT-L** member (public DINOv2/v3-L, frozen-LP) | A ensemble | 2nd decorrelated member if CNN alone isn't enough | Colab train |
+| 4 | **logit-adjusted BCE** | loss | agaldran's robust workhorse for the operating point | small code |
+| 5 | Generative (diffusion) hard positives | B novelty | break 127-pos wall (winner didn't) | heavy |
 | ~~x~~ | ~~CG-AMIL / @448 / MixStyle / aug-domain bundle~~ | — | **retired** — 2× no LB gain (exps/3, exps/4) | — |
 | ~~x~~ | ~~ConvNeXt-**Large** member~~ | — | **retired** — no gain over Tiny (0.909/0.965 < 0.932/0.976) | — |
 
@@ -157,17 +156,15 @@ Scored the 619 orig val frames with the exp4 ship (1 seed, orig view) and probed
 
 ---
 
-## 6. PRELIMINARY — PPV@90R decays with epochs while AUROC is flat (LOCO center_2, D2F-4a partial run, 2026-07-18)
-The ViT-anchor LOCO leg (dinov2 @336 simple recipe, holdout center_2) printed per-epoch held-out metrics before the run was interrupted:
+## 6. PPV@90R is NOISE-DOMINATED across epochs; AUPRC-selection is right (LOCO center_2, D2F-4a, 2026-07-18)
+Full 12-epoch curve of the ViT-anchor LOCO leg (dinov2 @448 simple recipe, holdout center_2). **Correction:** an earlier read of only ep1–5 looked like a monotone decay — the full curve shows it is not.
 
-| epoch | PPV@90R | AUROC | AUPRC |
-|---|---|---|---|
-| 1 | **0.597** (saved) | 0.989 | 0.970 |
-| 2 | 0.248 | 0.989 | 0.944 |
-| 3 | 0.184 | 0.970 | 0.933 |
-| 4 | 0.161 | 0.972 | 0.941 |
-| 5 | 0.067 | 0.954 | 0.910 |
+| epoch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10–12 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **PPV@90R** | **0.597** | 0.248 | 0.184 | 0.161 | 0.067 | 0.223 | 0.326 | 0.438 | 0.421 | 0.421 |
+| AUROC | 0.989 | 0.989 | 0.970 | 0.972 | 0.954 | 0.964 | 0.956 | 0.960 | 0.960 | 0.960 |
+| AUPRC | 0.970 | 0.944 | 0.933 | 0.941 | 0.910 | 0.932 | 0.927 | 0.932 | 0.932 | 0.931 |
 
-**PPV@90R peaks at epoch 1 and decays ~9× by epoch 5, while AUROC barely moves (0.989→0.954).** This is the operating-point erosion made visible: the concept-pretrained encoder is near-optimal at init (Kumar LP-FT; frozen-LP 0.929 > finetune) and each epoch pushes held-out negatives' scores up past the 90%-recall threshold without hurting the *ranking*. Implication: the 15-epoch ship (cell 11) likely **overshoots the PPV peak** — and unlike the LOCO legs, the ship (`holdout=none`) has no held-out signal to early-stop on, so it just runs 15 ep. **Fewer epochs / operating-point-aware ship-epoch selection is now queue #1** — potentially a bigger lever than de-floor or the ensemble.
+**PPV@90R swings 0.067–0.597 across epochs with all CIs overlapping ~[0.02, 0.84] (49 held-out pos) — it is noise-dominated, not a clean epoch trend.** AUROC/AUPRC are stable (0.95–0.99 / 0.91–0.97). So: **do NOT epoch-select on PPV@90R** — the existing **selection-on-AUPRC** is correct and it saved ep1 (AUPRC 0.970, which also happens to have the best PPV). The "fewer-epochs" hypothesis from the truncated read is **not supported**; the ship's AUPRC-based selection is fine. (Real caveat still stands: this is one leg, center_2 is optimistic vs the true 3rd center, and 49 pos is very few — read AUROC/AUPRC, treat any single PPV@90R point as noise.)
 
-⚠ Caveats: (1) center_2 is one of the two training centers held out — still optimistic vs the true unseen 3rd center (2-center wall); (2) 49 held-out pos → CIs are wide (ep1 CI[0.234,0.841]); the *monotone* 5-epoch decay is the signal, the absolute values are noisy. Confirm on the completed harness + an epochs sweep before acting.
+**Net:** the epoch curve is a warning about *reading PPV@90R at all* at this sample size, not a new lever. The decisive question stays the completed harness (both legs) → de-floor A/B + weighted-ensemble gate (§4).

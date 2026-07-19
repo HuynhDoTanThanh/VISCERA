@@ -32,18 +32,23 @@ def _score_finetuned(pt_paths, paths, bs=32, tta="hflip"):
     """Score one or more fine-tuned Nets (.pt): mean-prob over TTA views per model, then prob-averaged across models.
     tta='hflip' (orig+hflip) or '5view' (orig/hflip/vflip/rot90/rot270 = EXACTLY the shipped container)."""
     import torch
+    import phase3.finetune as ft
     from phase3.finetune import Net, FrameDS, device
     if isinstance(pt_paths, str):
         pt_paths = [pt_paths]
     views = ["orig", "hflip"] if tta == "hflip" else ["orig", "hflip", "vflip", "rot90", "rot270"]
     dev = device()
-    ds = FrameDS(list(paths), [0] * len(paths), train=False)
     acc = np.zeros(len(paths), dtype=np.float64)
     for pt in pt_paths:
         ckpt = torch.load(pt, map_location="cpu", weights_only=False)
         cfg = ckpt.get("cfg", {})
+        # match BOTH the resize (FrameDS) and the ViT pos_embed (Net img_size) to how THIS ckpt was trained.
+        # Net/FrameDS read the module-level ft.IMG (default 448 = the ship); a LOCO @336 ckpt needs it set to 336
+        # or pos_embed mismatches (1024 vs 576). Build the dataset AFTER setting IMG; supports mixed-img ensembles.
+        ft.IMG = int(cfg.get("img", ft.IMG))
         net = Net(cfg.get("unfreeze", 4), cg_head=cfg.get("cg_head", False), backbone=cfg.get("backbone", "dinov2")).to(dev)
         net.load_state_dict(ckpt["model"]); net.eval()
+        ds = FrameDS(list(paths), [0] * len(paths), train=False)
         dl = torch.utils.data.DataLoader(ds, batch_size=bs, num_workers=0)
         out = []
         with torch.no_grad():
