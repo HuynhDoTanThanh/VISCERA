@@ -76,7 +76,7 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 | WiSE-FT (weight-space) | post-hoc | ✅ | 🟢 used | anchor | ✅ keep |
 | color/FDA aug (`--aug domain`) | train-time | ✅ | 🟢 LB | in exp-4 bundle, no gain | ✗ no measurable LB win (confounded w/ @448+attn) |
 | MixStyle (feature-stat mixing) | train-time | ✅ | 🟢 LB | in exp-4 bundle, no gain | ✗ un-gateable rider; drop |
-| per-stack/center score de-floor (`SCORE_ALIGN_Q`) | post-hoc | ✅ | 🟡 val | **no-op** on exp4 (0.748→0.748); floor gap 1e-4 | ✗ **mechanism-MISMATCHED** — floods are in the UPPER neg tail, de-floor only touches the low quantile |
+| per-stack/center score de-floor (`SCORE_ALIGN_Q`) | post-hoc | ✅ | 🔵 **LOCO §7** | no-op on ViT (0.543→0.543); harmful on CNN (AUROC 0.950→0.837) | ❌ **DEAD** — no per-center floor gap even on the honest bench |
 | per-center robust-z norm | post-hoc | ✅ | 🟡 val | exp4 0.748→**0.664** (hurts); prior 0.471→0.517 | ✗ **HARMFUL** on same-center (IQR-divide adds noise when centers align) |
 | DANN / CORAL / Fishr / Tent | train/post | ✅ | prior | null / need >2 domains | ✗ rejected |
 
@@ -103,22 +103,24 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 | multi-scale TTA (448+384+512) | ✅ | 🟡 val | no help; hurts c1 | ✗ |
 | CNN member — ConvNeXt-**Tiny** head-only LP | ✅ member | 🔵 LOCO | AUROC **0.932 / 0.976** (c2/c1) | ✅ strong + decorrelated |
 | CNN member — ConvNeXt-**Large** head-only LP | ✅ member | 🔵 LOCO | AUROC **0.909 / 0.965** (c2/c1) | ✗ **no gain over Tiny** (worse, within noise) — revert to Tiny |
-| **D2F+ ViT ⊕ CNN equal rank-avg** | ✅ | 🟡 val | ens **drags** anchor: c2 PPV 0.396→**0.048**, AUROC 0.976→0.959 | ⚠ equal-weight HURTS the PPV@90R tail; val is a mirage → **needs LOCO gate + weighting** |
+| **D2F+ ViT ⊕ CNN (any weight)** | ✅ | 🔵 **LOCO §7** | ViT alone PPV **0.543**; every w<1 drops it (0.33→0.08); CNN tail-poisons | ❌ **FAILED honest harness — drop the CNN member** |
 | decorrelated multi-backbone (dinov2⊕dinov3) | ✅ | 🔵 LOCO | dinov3 drags 0.929→0.906 | ✗ (use CNN member instead) |
 | per-member affine recalibration (→1%) + per-stack de-floor | ⬜ | — | — | **the real operating-point lever — do this FIRST** |
 
 ---
 
-## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after the D2F+ val run)
+## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after the honest LOCO harness §7)
 | # | item | track | why | blocker |
 |---|---|---|---|---|
-| 1 | **Run the honest LOCO harness to completion** (cells D2F-4a/4b, both legs @448) | bench | the ONLY bench that sees the true new-center shift; A/B's de-floor AND the weighted ensemble on one center-blind proxy | Colab (2 ViT-LOCO finetunes) |
-| 2 | **Re-designed operating-point lever** — per-center UPPER-tail norm / affine→1% (NOT low-q de-floor, §5) | post-hoc | de-floor is mechanism-mismatched (flood is upper neg tail); affine rescales to target FPR | needs harness to validate |
-| 3 | Diverse **ViT-L** member (public DINOv2/v3-L, frozen-LP) | A ensemble | 2nd decorrelated member if CNN alone isn't enough | Colab train |
-| 4 | **logit-adjusted BCE** | loss | agaldran's robust workhorse for the operating point | small code |
+| 1 | **SHIP the simple @448 anchor** — dinov2 @448, mean-pool, concept+semi, WiSE-FT 0.7, NO cg-head/mixstyle/aug-domain | A | the harness anchor recipe; simpler than exp4 (which retired its bundle); a clean @448 version of the proven exps/2 | Colab ship (3 seeds, holdout=none) |
+| 2 | **affine→1% recalibration** at inference (winner's trick) | post-hoc | the ONE lever aimed at the 3rd-center score-shift the 2-center bench can't see; post-hoc so no retrain | faith-based (unverifiable locally) |
+| 3 | **logit-adjusted BCE** | loss | agaldran's robust workhorse for the operating point | small code |
+| 4 | Diverse **ViT-L** member — only if it matches the anchor's TAIL (CNN did not) | A ensemble | ensemble needs a member as strong at the operating point, not just AUROC | Colab train; high bar |
 | 5 | Generative (diffusion) hard positives | B novelty | break 127-pos wall (winner didn't) | heavy |
+| ~~x~~ | ~~D2F+ ViT⊕CNN ensemble~~ | — | **FAILED honest harness (§7)** — CNN drags PPV@90R at every weight (tail-poisoning) | — |
+| ~~x~~ | ~~per-stack/center de-floor (`SCORE_ALIGN_Q`)~~ | — | **FAILED honest harness (§7)** — no-op on ViT, harmful on CNN; no per-center floor gap | — |
 | ~~x~~ | ~~CG-AMIL / @448 / MixStyle / aug-domain bundle~~ | — | **retired** — 2× no LB gain (exps/3, exps/4) | — |
-| ~~x~~ | ~~ConvNeXt-**Large** member~~ | — | **retired** — no gain over Tiny (0.909/0.965 < 0.932/0.976) | — |
+| ~~x~~ | ~~ConvNeXt Large/Tiny member~~ | — | **retired** — member itself doesn't help the ensemble (§7) | — |
 
 ---
 
@@ -166,5 +168,31 @@ Full 12-epoch curve of the ViT-anchor LOCO leg (dinov2 @448 simple recipe, holdo
 | AUPRC | 0.970 | 0.944 | 0.933 | 0.941 | 0.910 | 0.932 | 0.927 | 0.932 | 0.932 | 0.931 |
 
 **PPV@90R swings 0.067–0.597 across epochs with all CIs overlapping ~[0.02, 0.84] (49 held-out pos) — it is noise-dominated, not a clean epoch trend.** AUROC/AUPRC are stable (0.95–0.99 / 0.91–0.97). So: **do NOT epoch-select on PPV@90R** — the existing **selection-on-AUPRC** is correct and it saved ep1 (AUPRC 0.970, which also happens to have the best PPV). The "fewer-epochs" hypothesis from the truncated read is **not supported**; the ship's AUPRC-based selection is fine. (Real caveat still stands: this is one leg, center_2 is optimistic vs the true 3rd center, and 49 pos is very few — read AUROC/AUPRC, treat any single PPV@90R point as noise.)
+
+---
+
+## 7. DECISIVE — honest LOCO harness kills BOTH de-floor and the ensemble (D2F-4a/4b, 2026-07-21)
+Completed harness, both legs @448: pooled center-blind proxy (n=619, 31 pos; center_1 scored by the model that held out center_1, center_2 by the model that held out center_2).
+
+**(A) DE-FLOOR (`SCORE_ALIGN_Q=0.10`, on raw scores):**
+| member | PPV@90R raw | PPV@90R +defloor | AUROC raw→defloor |
+|---|---|---|---|
+| ViT anchor | **0.5429** | **0.5429** (exact no-op) | 0.992 → 0.992 |
+| CNN member | 0.0752 | 0.0360 (worse) | 0.950 → 0.837 |
+
+**(B) WEIGHTED ENSEMBLE** (rank-fuse `w·ViT+(1−w)·CNN`, raw):
+| w_ViT | 1.0 | 0.8 | 0.7 | 0.6 | 0.5 | 0.3 | 0.0 |
+|---|---|---|---|---|---|---|---|
+| PPV@90R | **0.543** | 0.331 | 0.229 | 0.221 | 0.229 | 0.124 | 0.075 |
+| AUROC | 0.992 | 0.989 | 0.987 | 0.984 | 0.980 | 0.971 | 0.950 |
+
+**Verdicts (on the honest bench, not the val mirage):**
+1. **de-floor is DEAD** — exact no-op on the ViT anchor (no per-center floor gap to cancel, confirming §5), and actively harmful on the CNN (AUROC 0.950→0.837). Keep `SCORE_ALIGN_Q=None`.
+2. **the D2F+ ensemble is DEAD** — the ViT anchor (PPV 0.543 / AUROC 0.992) dwarfs the CNN at the operating point (PPV 0.075) despite the CNN's decent AUROC (0.950). Adding *any* CNN weight drops PPV@90R monotonically — the winner's ResNet⊕ViT lever does not transfer here because our CNN's tail is far noisier than the ViT's. **Drop the CNN member; ship the anchor alone.**
+3. **the 2-center wall is the real ceiling** — the ViT anchor already hits AUROC 0.992 / PPV 0.543 on this bench, i.e. there is almost no center_1↔center_2 shift left to exploit, which is exactly why both levers find nothing. But the leaderboard's 3rd unseen center reads 0.015 — a shift **no 2-center bench can measure**. Both levers we built target the (small) 2-center shift, not the (large) 3rd-center one.
+
+*(Caveat: cell 4b's "+defloor" column under (B) applies de-floor to rank-transformed scores — a mis-application that collapses PPV to ~0.02; ignore it. The meaningful de-floor numbers are (A), on raw scores.)*
+
+**Action:** ship the **simple @448 anchor** (queue #1) — no ensemble, no de-floor, no CG-AMIL bundle. The only remaining lever that could touch the 3rd-center shift is **affine→1% recalibration** (post-hoc, faith-based — the bench structurally can't validate it). Everything else on the ranking side is at ceiling on the only honest bench we have.
 
 **Net:** the epoch curve is a warning about *reading PPV@90R at all* at this sample size, not a new lever. The decisive question stays the completed harness (both legs) → de-floor A/B + weighted-ensemble gate (§4).
