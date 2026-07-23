@@ -10,15 +10,27 @@
 
 ---
 
-## 1. Main results — the 4 real submissions
-| exp | encoder | FT | header | concept | semi | aug | 🟢 PPV@90R | 🟢 AUROC | AUPRC |
-|---|---|---|---|---|---|---|---|---|---|
-| exp1 | GastroNet-DINOv2 ViT-B @336 | full-FT | cls⊕mean | ✗ | ✗ | mild | 0.0181 | 0.845 | 0.356 |
-| **exps/2** 🏆 | GastroNet-DINOv2 ViT-B @336 | full-FT | cls⊕mean | ✓ | ✓ | mild | **0.0177** | **0.854** | 0.401 |
-| exps/3 | DINOv3 ViT-B @448 | full-FT | CG-AMIL attn | ✓ | ✓ | strong-geom | 0.0117 | 0.756 | 0.300 |
-| exps/4 | GastroNet-DINOv2 ViT-B @448 | full-FT | CG-AMIL attn | ✓ | ✓ | domain+mixstyle | 0.0155 | 0.829 | 0.355 |
+## 1. Main results — the 5 real submissions
+| exp | encoder | FT | header | concept | semi | **img** | aug | 🟢 PPV@90R | 🟢 AUROC | AUPRC |
+|---|---|---|---|---|---|---|---|---|---|---|
+| exp1 | GastroNet-DINOv2 ViT-B | full-FT | cls⊕mean | ✗ | ✗ | **336** | mild | 0.0181 | 0.845 | 0.356 |
+| **exps/2** 🏆 | GastroNet-DINOv2 ViT-B | full-FT | cls⊕mean | ✓ | ✓ | **336** | mild | **0.0177** | **0.854** | 0.401 |
+| exps/3 | DINOv3 ViT-B | full-FT | CG-AMIL attn | ✓ | ✓ | 448 | strong-geom | 0.0117 | 0.756 | 0.300 |
+| exps/4 | GastroNet-DINOv2 ViT-B | full-FT | CG-AMIL attn | ✓ | ✓ | 448 | domain+mixstyle | 0.0155 | 0.829 | 0.355 |
+| exps/5 | GastroNet-DINOv2 ViT-B | full-FT | cls⊕mean | ✓ | ✓ | 448 | mild | 0.0128 | **0.797** | 0.351 |
 
-**exp-4 validation (RARE25 val, separate held-out):** PPV@90R 0.0114 · AUROC 0.8626 · AUPRC 0.6109.
+**exp-4 validation (RARE25 val):** PPV@90R 0.0114 · AUROC 0.8626 · AUPRC 0.6109. **exp-5 validation (RARE25 val):** PPV@90R 0.0121 · AUROC 0.8481 · AUPRC 0.5771.
+
+### ⚑ exp-5 analysis — RESOLUTION @448 is the regression, NOT the bundle (corrects the §7 conclusion)
+exp-5 = exp-4 **minus** the bundle (mean-pool, no CG-AMIL / MixStyle / aug-domain), held at @448. The plan was "drop the bundle → recover exps/2." Instead exp-5 came out the **WORST dinov2 run**: PPV 0.0128, AUROC **0.797** — below even exp-4. The clean read is on **AUROC (stable; PPV@90R is noise at 31 pos, all CIs overlap ~0.010–0.11)**:
+
+| | @336 (exp1, exps/2) | @448 (exp4, exp5) |
+|---|---|---|
+| LB AUROC | 0.845, **0.854** | 0.829, **0.797** |
+
+**Both @336 runs beat both @448 runs — a consistent 4-point signal, not noise.** The regression vs exps/2 was never the bundle; it was **resolution**. I isolated the wrong variable in §7 (exp5 vs exp4 held @448 to test "the bundle", but the real killer vs exps/2 was the @336→@448 change that exp5 kept). Mechanism: @448 exposes more high-frequency detail → more scope/acquisition-specific texture the model latches onto → worse transfer to the true 3rd center. The honest 2-center harness (§7) **could not catch this** — the @448 penalty only manifests on the unseen 3rd center, which no 2-center bench sees (it read the @448 anchor at AUROC 0.992 — the mirage).
+
+Nuance: **at @448 the bundle actually helps** (exp4 0.829 > exp5 0.797) — aug-domain + MixStyle partially regularize the high-res center shortcuts — but neither recovers the @336 baseline. **Fix = stay at @336, not "@448 + bundle" nor "@448 simple."** The winning recipe remains exps/2 @336; it is still the best submission after 3 attempts (exp3/4/5) to beat it all regressed.
 
 ### exp-4 analysis — the bundle does NOT beat the simple anchor (2nd confirmation)
 exp-4 = the **winning dinov2 backbone** + everything we could bolt on (@448, CG-AMIL attention head, MixStyle, `--aug domain`). It **did not improve** on exps/2: PPV −0.0022, AUROC −0.025, AUPRC −0.046 — every delta **within the noise floor** (AUROC Δ<0.03; PPV 95% CIs overlap almost entirely, 0.010–0.11). So exp-4 ≈ exps/2 statistically, at **~2× the compute** and much more complexity.
@@ -109,17 +121,18 @@ The real new asset is the **decorrelated CNN member** (§H): ConvNeXt head-only 
 
 ---
 
-## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after the honest LOCO harness §7)
+## 3. NOT-DONE — the queue (ranked by EV to win, re-ranked after exp-5 → resolution finding §8)
 | # | item | track | why | blocker |
 |---|---|---|---|---|
-| 1 | **SHIP the simple @448 anchor** — dinov2 @448, mean-pool, concept+semi, WiSE-FT 0.7, NO cg-head/mixstyle/aug-domain | A | the harness anchor recipe; simpler than exp4 (which retired its bundle); a clean @448 version of the proven exps/2 | Colab ship (3 seeds, holdout=none) |
-| 2 | **affine→1% recalibration** at inference (winner's trick) | post-hoc | the ONE lever aimed at the 3rd-center score-shift the 2-center bench can't see; post-hoc so no retrain | faith-based (unverifiable locally) |
-| 3 | **logit-adjusted BCE** | loss | agaldran's robust workhorse for the operating point | small code |
-| 4 | Diverse **ViT-L** member — only if it matches the anchor's TAIL (CNN did not) | A ensemble | ensemble needs a member as strong at the operating point, not just AUROC | Colab train; high bar |
-| 5 | Generative (diffusion) hard positives | B novelty | break 127-pos wall (winner didn't) | heavy |
+| 0 | **exps/2 @336 IS the ship** — it is still the best board score (0.0177) after exp3/4/5 all regressed | — | 4-point AUROC signal: @336 > @448. Stop chasing @448 variants | none — weights in exps/2/ |
+| 1 | **@336 replicas / small wins on the @336 recipe** — more seeds, or exps/2 + `--aug domain` (color-only, no @448) | A | @336 is the resolution; explore levers WITHOUT changing it | Colab ship @336 |
+| 2 | **affine→1% recalibration** on exps/2 (winner's trick) | post-hoc | the ONE lever aimed at the 3rd-center score-shift the 2-center bench can't see; post-hoc, no retrain | faith-based (unverifiable locally) |
+| 3 | **logit-adjusted BCE** at @336 | loss | agaldran's robust workhorse for the operating point | small code |
+| 4 | Generative (diffusion) hard positives | B novelty | break 127-pos wall (winner didn't) | heavy |
+| ~~x~~ | ~~ANY @448 recipe~~ | — | **RETIRED §8** — both @448 runs (exp4, exp5) < both @336 runs on stable AUROC | — |
 | ~~x~~ | ~~D2F+ ViT⊕CNN ensemble~~ | — | **FAILED honest harness (§7)** — CNN drags PPV@90R at every weight (tail-poisoning) | — |
 | ~~x~~ | ~~per-stack/center de-floor (`SCORE_ALIGN_Q`)~~ | — | **FAILED honest harness (§7)** — no-op on ViT, harmful on CNN; no per-center floor gap | — |
-| ~~x~~ | ~~CG-AMIL / @448 / MixStyle / aug-domain bundle~~ | — | **retired** — 2× no LB gain (exps/3, exps/4) | — |
+| ~~x~~ | ~~CG-AMIL / MixStyle / aug-domain bundle~~ | — | **retired** — no LB gain (exps/3, exps/4); at @336 the bundle is untested but @448 is the confound | — |
 | ~~x~~ | ~~ConvNeXt Large/Tiny member~~ | — | **retired** — member itself doesn't help the ensemble (§7) | — |
 
 ---
@@ -193,6 +206,26 @@ Completed harness, both legs @448: pooled center-blind proxy (n=619, 31 pos; cen
 
 *(Caveat: cell 4b's "+defloor" column under (B) applies de-floor to rank-transformed scores — a mis-application that collapses PPV to ~0.02; ignore it. The meaningful de-floor numbers are (A), on raw scores.)*
 
-**Action:** ship the **simple @448 anchor** (queue #1) — no ensemble, no de-floor, no CG-AMIL bundle. The only remaining lever that could touch the 3rd-center shift is **affine→1% recalibration** (post-hoc, faith-based — the bench structurally can't validate it). Everything else on the ranking side is at ceiling on the only honest bench we have.
+**Action:** ship the **simple @448 anchor** (queue #1) — no ensemble, no de-floor, no CG-AMIL bundle. The only remaining lever that could touch the 3rd-center shift is **affine→1% recalibration** (post-hoc, faith-based — the bench structurally can't validate it). Everything else on the ranking side is at ceiling on the only honest bench we have. **[SUPERSEDED by §8 — this "ship @448 anchor" action produced exp-5, which regressed; the @448 resolution was the culprit the 2-center harness couldn't see.]**
+
+---
+
+## 8. DECISIVE — RESOLUTION @448 is the regression; @336 is the ship (exp-5 LB, 2026-07-23)
+exp-5 (the "simple @448 anchor" §7 recommended) scored **PPV 0.0128 / AUROC 0.797** — the worst dinov2 run. Reading the **stable** metric (AUROC; PPV@90R is noise at 31 pos):
+
+| recipe | img | LB AUROC | LB PPV@90R |
+|---|---|---|---|
+| exps/2 (concept+semi) | **336** | **0.854** | 0.0177 |
+| exp1 (simple) | **336** | 0.845 | 0.0181 |
+| exp4 (bundle) | 448 | 0.829 | 0.0155 |
+| exp5 (simple) | 448 | **0.797** | 0.0128 |
+
+**Both @336 runs beat both @448 runs — a consistent 4-experiment AUROC signal.** The regression across exp3/4/5 was **resolution**, not the header/aug bundle. Why §7 missed it: the honest LOCO harness ran @448 and read the anchor at AUROC 0.992 — but that is the **2-center bench**, and the @448 penalty only appears on the **true 3rd center** (higher resolution → more scope/acquisition-specific high-frequency texture → worse transfer to an unseen center). No 2-center bench can measure a 3rd-center penalty; only the LB can, and it did.
+
+Nuance already visible in the table: **at @448, the bundle helps** (exp4 0.829 > exp5 0.797 — aug-domain/MixStyle partially regularize the high-res shortcuts) but does not recover @336. So the fix is **not** "add the bundle back"; it is **stay at @336**.
+
+**Correction of the §7 error:** exp-5 was designed to isolate "the bundle" by holding @448 — but the real difference vs the winning exps/2 was the @336→@448 change, which exp-5 kept. Isolated the wrong variable. **Lesson: when a same-2-center bench says a lever is neutral/good, it can still be a 3rd-center regression — resolution/aug that add center-specific capacity are exactly the levers a 2-center bench is blind to.**
+
+**Bottom line:** **exps/2 @336 remains the best submission (0.0177) and is the ship.** After exp3 (dinov3), exp4 (@448 bundle), exp5 (@448 simple) all regressed, the evidence says: keep GastroNet-DINOv2 **@336**, concept+semi, cls⊕mean, WiSE-FT. The only untried lever aimed at the real 3rd-center shift is post-hoc **affine→1% recalibration** on exps/2; everything on the ranking/resolution/ensemble side has been tried and lost.
 
 **Net:** the epoch curve is a warning about *reading PPV@90R at all* at this sample size, not a new lever. The decisive question stays the completed harness (both legs) → de-floor A/B + weighted-ensemble gate (§4).
