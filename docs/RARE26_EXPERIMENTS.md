@@ -229,3 +229,22 @@ Nuance already visible in the table: **at @448, the bundle helps** (exp4 0.829 >
 **Bottom line:** **exps/2 @336 remains the best submission (0.0177) and is the ship.** After exp3 (dinov3), exp4 (@448 bundle), exp5 (@448 simple) all regressed, the evidence says: keep GastroNet-DINOv2 **@336**, concept+semi, cls⊕mean, WiSE-FT. The only untried lever aimed at the real 3rd-center shift is post-hoc **affine→1% recalibration** on exps/2; everything on the ranking/resolution/ensemble side has been tried and lost.
 
 **Net:** the epoch curve is a warning about *reading PPV@90R at all* at this sample size, not a new lever. The decisive question stays the completed harness (both legs) → de-floor A/B + weighted-ensemble gate (§4).
+
+---
+
+## 9. DEEP CODE AUDIT (2026-07-23) — one real logic bug, one prevalence bug, and the 300k-generalization lever
+Two parallel bug-hunt agents (metric + training loop) + manual audit of preprocessing, semi pipeline, and the 300k pool.
+
+### BUG 1 (logic, cross-center) — finetune-LOCO LEAKS the held-out center → optimistic compass
+`finetune.py` adds the `--neg-list` and `--semi-manifest` (288k) pools to training with **no center filter**, and `unl_manifest.npz` has an **empty `center` field** for every unlabeled frame (names are numeric IDs, `source_path=None`) — so they **cannot** be center-filtered. Under `--holdout`, the held-out center's unlabeled frames remain in the semi pool and are trained on as consistency targets = **unsupervised domain adaptation TO the test center**. Consequence: **finetune-LOCO is optimistic.** This is exactly why the §7 harness (semi ON) read AUROC 0.992 / "2-center wall, nothing to exploit" — leak-inflated. The leak-free `loco_probe.py` (frozen-LP, no semi) is the compass that **predicted the leaderboard** (dinov3 0.776 ≈ hidden 0.756). **The ship (`--holdout none`) is unaffected — all LB scores are real; only the local LOCO compass was lying.** Fix: added `--loco-no-semi` (drops both unlabeled pools under `--holdout` for a leak-free labeled-only compass) + a loud LEAK WARNING. → §7's "nothing to exploit" is retracted; there may be more cross-center headroom than the leaked harness showed.
+
+### BUG 2 (prevalence) — `.009` instead of `.01`
+`loco_probe.py:70` and a notebook cell used `.009/(.009+.99f)` (0.9% prevalence, and internally inconsistent) — understates PPV up to ~10% and breaks cross-cell comparability. Fixed to `.01/(.01+.99f)`. The trusted harness `evaluate.py` was already correct (curve-point, 1% via resampling, median bootstrap, AUPRC selection).
+
+### Audited CLEAN (no bug)
+WiSE-FT mixing (correct two states, direction, in-place save), pos/neg sampler, `bce+rank+pauc` (all three terms, signs, reductions), concept-init loading (loud assert vs silent SSL revert), EMA/Mean-Teacher consistency + one-sided PU, AUPRC-based selection, `AcquisitionAug` (FFT phase preserved, amplitude jittered), and — verified on the real test TIFF — SimpleITK reads RGB identical to PIL (mean abs diff 0.0, no BGR/channel bug). Minor: LOCO gate/selection scores are computed on the pre-WiSE-FT model (documented; ship is the WiSE-FT'd model).
+
+### The 300k-pool finding → exp6
+The 288k semi-consistency **strong view** is `a.aug`-dependent: at `mild` it is **geometric** RandAugment, which does NOT perturb the per-center **color** axis (the 0.996-separability root disease). Only `--aug domain` makes it AcquisitionAug (white-balance+HSV+FDA+gamma). So at the winning resolution (@336, `aug=mild`), the 300k pool has only ever taught geometric invariance — its cross-center generalization power was never engaged. Supervised loss →0.0006 by ep8 (memorizes the 127 positives); semi + WiSE-FT are the only regularizers, so pointing them at the color axis is the lever. **exp6 = exps/2 @336 + `--aug domain`** (one change vs the best) engages both the labeled color-randomization AND the 288k color-consistency = the winner's color-aug lever, never tried at @336. Gate it leak-free with `--loco-no-semi` (notebook cell) before submitting.
+
+**Bottom line:** the pipeline is mechanically sound (no score-capping bug in the ship path); the real defects were (1) a leaked LOCO compass that mis-guided our lever selection and (2) the 300k pool teaching the wrong invariance at @336. exp6 fixes (2); `--loco-no-semi` + `loco_probe.py` fix (1) so future gating is honest.
