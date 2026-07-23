@@ -397,6 +397,12 @@ def main():
                     help="VLM suspicion below this = confident-NEGATIVE pseudo-label (target 0). Positives NOT pseudo-"
                          "labeled (high suspicion includes NDBE look-alikes) -> one-sided PU.")
     ap.add_argument("--ema-decay", type=float, default=0.99, help="EMA teacher decay for the consistency target")
+    ap.add_argument("--loco-no-semi", action="store_true",
+                    help="HONEST-LOCO: when --holdout is a center, DISABLE the unlabeled pools (semi + neg-list). The "
+                         "unlabeled frames carry NO center label (manifest 'center' is empty), so they CANNOT be "
+                         "center-filtered — leaving them in trains the model on the held-out center via consistency "
+                         "(unsupervised domain adaptation TO the test center) and inflates LOCO. Set this for a "
+                         "leak-free labeled-only cross-center compass. No effect on the ship (--holdout none).")
     ap.add_argument("--semi-rampup", type=int, default=5, help="epochs to ramp the semi weight 0->1 after --warmup")
     # ---- CG-AMIL head: gated attention-MIL pooling (lifts a few-patch lesion vs mean-pool) + entropy floor ----
     ap.add_argument("--backbone", choices=["dinov2", "dinov3"], default="dinov3",
@@ -447,9 +453,15 @@ def main():
     else:
         trm = np.ones(len(paths), bool); vam = np.zeros(len(paths), bool)
     tp, tl = list(paths[trm]), list(labels[trm])
-    if extra_neg:
+    # LEAK GUARD: the unlabeled pools (neg-list + semi) have NO center label and cannot be filtered to exclude the
+    # held-out center. Under --holdout they otherwise leak that center into training (UDA to the test center ->
+    # optimistic LOCO). --loco-no-semi drops both pools for an honest labeled-only cross-center compass.
+    loco_drop_unl = (a.holdout != "none") and a.loco_no_semi
+    if extra_neg and not loco_drop_unl:
         tp += extra_neg; tl += [0] * len(extra_neg)
         print(f"+ {len(extra_neg)} unlabeled negatives")
+    elif extra_neg and loco_drop_unl:
+        print(f"HONEST-LOCO: dropped {len(extra_neg)} unlabeled negatives (--loco-no-semi, anti-leak)")
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     net = Net(a.unfreeze, init_ckpt=a.init or None, head_only=a.head_only, cg_head=a.cg_head, backbone=a.backbone,
               mixstyle=a.mixstyle, mixstyle_p=a.mixstyle_p, mixstyle_alpha=a.mixstyle_alpha).to(dev)
@@ -476,7 +488,13 @@ def main():
 
     # ---- semi-supervised setup: sample the VLM pool + build an EMA teacher (off unless --semi-manifest) ----
     semi_dl, ema = None, None
-    if a.semi_manifest and os.path.exists(a.semi_manifest):
+    if a.semi_manifest and os.path.exists(a.semi_manifest) and loco_drop_unl:
+        print("HONEST-LOCO: semi pool DISABLED (--loco-no-semi) -> leak-free labeled-only cross-center compass")
+    elif a.semi_manifest and os.path.exists(a.semi_manifest) and a.holdout != "none":
+        print("⚠ LEAK WARNING: LOCO with the semi pool ON — unlabeled frames have no center label, so the held-out "
+              "center may be in the pool (UDA to the test center) -> LOCO is OPTIMISTIC. Use --loco-no-semi for an "
+              "honest compass, or trust phase3/loco_probe.py (frozen-LP, semi-free) which predicted the leaderboard.")
+    if a.semi_manifest and os.path.exists(a.semi_manifest) and not loco_drop_unl:
         import copy
         z = np.load(a.semi_manifest, allow_pickle=True)
         up, us = z["img_path"], z["suspicion"]

@@ -67,7 +67,7 @@ def fpr90(y,s,R=.9):
     if P==0 or Nn==0: return np.nan
     o=np.argsort(-s,kind="mergesort"); ys=y[o]; tp=np.cumsum(ys); fp=np.cumsum(1-ys); rc=tp/P
     return fp[min(np.searchsorted(rc,R),len(rc)-1)]/Nn
-def ppv1(f): return np.nan if np.isnan(f) else .009/(.009+.99*f)
+def ppv1(f): return np.nan if np.isnan(f) else .01/(.01+.99*f)   # 1% prevalence (was .009 — prevalence bug)
 def auc(y,s): return roc_auc_score(y,s) if len(set(y))>1 else float("nan")
 def boot_ppv(y,s,B=1000):
     rng=np.random.RandomState(0); n=len(y); out=[]
