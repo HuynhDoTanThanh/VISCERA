@@ -112,6 +112,18 @@ class Net(nn.Module):
         assert not miss and not unexp, f"backbone {backbone} mismatch: missing={list(miss)[:4]} unexpected={list(unexp)[:4]}"
         if init_ckpt:
             ck = torch.load(init_ckpt, map_location="cpu", weights_only=False)
+            # RESOLUTION PROVENANCE: pretrain_concept.py had no --img and inherited featurize.IMG, which was flipped
+            # 336->448 in commit f4271e2. A Stage-1 encoder built after that is a 448 model; loading it into a @336
+            # Stage-2 silently re-introduces the exact resolution the leaderboard proved regressive (docs §8), and
+            # pos_embed interpolation hides it. Warn loudly rather than let it ride as an uncontrolled variable.
+            ck_img = (ck.get("cfg") or {}).get("img")
+            if ck_img is not None and int(ck_img) != int(IMG):
+                print(f"⚠ RESOLUTION MISMATCH: concept encoder {init_ckpt} was pretrained @{ck_img} but Stage-2 runs "
+                      f"@{IMG}. pos_embed will be interpolated, but the blocks were adapted to a different token "
+                      f"grid — this is an UNCONTROLLED second variable. Rebuild Stage-1 with --img {IMG}.", flush=True)
+            elif ck_img is None:
+                print(f"⚠ concept encoder {init_ckpt} has no 'img' in cfg (built before --img existed) — its "
+                      f"resolution is UNVERIFIABLE. If it predates 2026-07-12 it is @336, otherwise @448.", flush=True)
             bk2 = vit_mod.checkpoint_filter_fn(ck["backbone"], m)   # interpolates pos_embed if IMG changed (336->448)
             bk2.pop("mask_token", None)
             m2, u2 = m.load_state_dict(bk2, strict=False)
@@ -190,8 +202,14 @@ class AcquisitionAug:
 
 
 class FrameDS(torch.utils.data.Dataset):
-    def __init__(self, paths, labels, train=True, aug="mild", aug_config="rand-m6-mstd0.6-inc1"):
+    def __init__(self, paths, labels, train=True, aug="mild", aug_config="rand-m6-mstd0.6-inc1", img=None):
         self.paths, self.labels, self.train = paths, labels, train
+        # Resolution is captured HERE (parent process) and stored on the instance, never read from the module global
+        # inside __getitem__. `main()` sets the global via `global IMG; IMG = a.img`, but DataLoader workers started
+        # with the *spawn* method re-import this module fresh and see the original featurize.IMG — so --img silently
+        # did not reach the data pipeline off-Linux (Colab uses fork, which masked it). The instance attr is pickled
+        # to workers, so the resolution is now correct under fork AND spawn.
+        IMG = self.img = int(img) if img is not None else globals()["IMG"]
         if not train:
             self.tf = T.Resize((IMG, IMG))                # eval: deterministic, NO aug (train/serve parity)
         elif aug == "strong":
@@ -234,9 +252,9 @@ class FrameDS(torch.utils.data.Dataset):
         return len(self.paths)
 
     def __getitem__(self, i):
-        im = Image.open(self.paths[i]).convert("RGB")
-        im = self.tf(im) if self.train else self.tf(im)
-        x = (torch.from_numpy(np.asarray(im.resize((IMG, IMG)), np.float32).copy()).permute(2, 0, 1) / 255. - _MEAN) / _STD
+        im = self.tf(Image.open(self.paths[i]).convert("RGB"))
+        x = (torch.from_numpy(np.asarray(im.resize((self.img, self.img)), np.float32).copy())
+             .permute(2, 0, 1) / 255. - _MEAN) / _STD
         return x, float(self.labels[i])
 
 
@@ -245,8 +263,12 @@ class UnlabeledDS(torch.utils.data.Dataset):
     weak = mild aug (EMA-teacher target), strong = endoscopy RandAugment (student input) — FixMatch/Mean-Teacher
     consistency. The 168k-frame pool regularizes the model instead of memorizing the 127 positives (anti-overfit),
     and the VLM suspicion gives a one-sided-PU confident-NEGATIVE signal (low suspicion = clearly normal mucosa)."""
-    def __init__(self, img_paths, susp, aug_config="rand-m6-mstd0.6-inc1", aug="strong"):
+    def __init__(self, img_paths, susp, aug_config="rand-m6-mstd0.6-inc1", aug="strong", cneg=None, img=None):
         self.paths = list(img_paths); self.susp = np.asarray(susp, np.float32)
+        IMG = self.img = int(img) if img is not None else globals()["IMG"]   # see FrameDS: spawn-safe resolution
+        # cneg = precomputed one-sided-PU confident-negative mask (suspicion, optionally AND'd with the VLM decision
+        # bucket). Passed through instead of re-derived in the train loop so the decision field is honoured.
+        self.cneg = np.asarray(cneg, bool) if cneg is not None else (self.susp < 0.15)
         self.weak = T.Compose([T.RandomResizedCrop(IMG, scale=(0.7, 1.0)), T.RandomHorizontalFlip()])
         if aug == "domain":
             # §19: the consistency STRONG view perturbs the acquisition-color axis -> the student learns to be
@@ -266,11 +288,12 @@ class UnlabeledDS(torch.utils.data.Dataset):
         return len(self.paths)
 
     def _norm(self, im):
-        return (torch.from_numpy(np.asarray(im.resize((IMG, IMG)), np.float32).copy()).permute(2, 0, 1) / 255. - _MEAN) / _STD
+        return (torch.from_numpy(np.asarray(im.resize((self.img, self.img)), np.float32).copy())
+                .permute(2, 0, 1) / 255. - _MEAN) / _STD
 
     def __getitem__(self, i):
         im = Image.open(self.paths[i]).convert("RGB")
-        return self._norm(self.weak(im)), self._norm(self.strong(im)), float(self.susp[i])
+        return self._norm(self.weak(im)), self._norm(self.strong(im)), float(self.cneg[i])
 
 
 class PosBalancedBatchSampler(torch.utils.data.Sampler):
@@ -336,7 +359,21 @@ def layerwise_param_groups(net, base_lr, decay=0.75, head_lr_mult=10.0):
     norm_ps = [p for p in net.backbone.norm.parameters() if p.requires_grad]
     if norm_ps:
         groups.append({"params": norm_ps, "lr": base_lr})
-    groups.append({"params": net.head.parameters(), "lr": base_lr * head_lr_mult})
+    # NB: materialise as lists, never generators — a generator stored in a param group is exhausted by the first
+    # thing that iterates it (the coverage assert below), leaving the optimizer with an EMPTY head group.
+    groups.append({"params": list(net.head.parameters()), "lr": base_lr * head_lr_mult})
+    # BUGFIX (2026-08): the CG-AMIL AttnPool is a SIBLING of net.head, not inside it — it was never added to any
+    # param group, so AdamW never updated it. Every --cg-head run (exps/3, exps/4, the notebook BUNDLE arm) trained
+    # and shipped attention weights frozen at RANDOM init, and the entropy-floor penalty backpropped into params
+    # whose grads were never applied nor zeroed. Every "CG-AMIL regressed" conclusion measured random attention.
+    if getattr(net, "attn", None) is not None:
+        groups.append({"params": list(net.attn.parameters()), "lr": base_lr * head_lr_mult})
+    # fail loud if any trainable tensor is missing from the optimizer (this is how the bug above hid for 5 experiments)
+    in_groups = sum(p.numel() for g in groups for p in g["params"])
+    trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    assert in_groups == trainable, (
+        f"optimizer misses {trainable - in_groups} trainable params "
+        f"({in_groups} in groups vs {trainable} requires_grad) — a module is not covered by layerwise_param_groups")
     return groups
 
 
@@ -344,7 +381,11 @@ def load_split(csv_path, neg_list="", neg_cap=0):
     rows = list(csv.DictReader(open(csv_path)))
     paths = [r["path"] for r in rows]; labels = [int(r["label"]) for r in rows]; centers = [r["center"] for r in rows]
     extra_neg = []
-    if neg_list and os.path.exists(neg_list):
+    if neg_list:
+        # FAIL LOUD: a mistyped/absent --neg-list used to silently run fully-supervised, so an "experiment with the
+        # unlabeled pool" could be a no-pool run and nobody would know. Same guard as --semi-manifest in main().
+        if not os.path.exists(neg_list):
+            raise FileNotFoundError(f"--neg-list {neg_list} does not exist (refusing to silently drop the pool)")
         extra_neg = [ln.strip() for ln in open(neg_list) if ln.strip()][:neg_cap] if neg_cap else [ln.strip() for ln in open(neg_list)]
     return np.array(paths), np.array(labels), np.array(centers), extra_neg
 
@@ -352,7 +393,7 @@ def load_split(csv_path, neg_list="", neg_cap=0):
 @torch.no_grad()
 def evaluate_center(net, paths, labels, centers, dev, bs=64):
     net.eval()
-    ds = FrameDS(paths, labels, train=False)
+    ds = FrameDS(paths, labels, train=False, img=IMG)
     dl = torch.utils.data.DataLoader(ds, batch_size=bs, num_workers=0)  # eval set is small; avoids spawn issues
     sc = []
     for x, _ in dl:
@@ -429,6 +470,28 @@ def main():
                          "with fresh strong-aug each, WITHOUT repeating the labeled set more. Coverage/epoch = "
                          "26*semi_steps*semi_bs frames. e.g. 8 -> ~20k/epoch at semi_bs=96.")
     ap.add_argument("--lr-decay", type=float, default=0.75, help="layer-wise LR decay factor")
+    ap.add_argument("--pauc-q", type=float, default=0.2,
+                    help="quantile of the POSITIVE scores that soft_pauc90 defends. The leaderboard thresholds at "
+                         "recall=0.90, i.e. ~the 10th-percentile positive — with the default q=0.2 the model is "
+                         "actually trained for PPV@80R and has no trained margin below that point. 0.0625-0.10 "
+                         "targets the real operating point (needs --pos-per-batch >=16 to estimate the deep quantile).")
+    # ---- semi-supervised signal quality (the 144k pool). Defaults reproduce the historical behaviour exactly. ----
+    ap.add_argument("--semi-mode", choices=["mse", "fixmatch"], default="mse",
+                    help="mse = the original unmasked prob-space Mean-Teacher MSE (self-extinguishing: once the PU "
+                         "term saturates the pool to ~0, (ps-pt)^2 ~ 1e-4 and the 144k frames stop contributing any "
+                         "gradient). fixmatch = confidence-masked hard pseudo-label CE on the strong view (Sohn 2020) "
+                         "-> gradient persists at saturation and only confident frames are used.")
+    ap.add_argument("--semi-conf", type=float, default=0.95,
+                    help="--semi-mode fixmatch: teacher confidence mask (use frames with pt>conf or pt<1-conf).")
+    ap.add_argument("--semi-use-decision", action="store_true",
+                    help="gate the one-sided-PU confident-negative target on the VLM decision field "
+                         "(decision=='CONFIDENT_NEGATIVE') in ADDITION to suspicion<--semi-lo. Without it, ABSTAIN "
+                         "frames whose suspicion is missing (defaulted to 0.0 by mine_hardneg) are hard-taught as "
+                         "negatives — exactly the bucket where unlabeled positives hide.")
+    ap.add_argument("--ship-ema", action="store_true",
+                    help="also save the EMA teacher (a temporal weight-average, usually the better OOD model — "
+                         "Tarvainen & Valpola 2017) next to the student as <out>_ema.pt. Currently the teacher is "
+                         "built and updated every step, then thrown away at ship.")
     ap.add_argument("--ohem-k", type=int, default=0,
                     help="tail-weighted margin: keep k hardest negatives per positive in the pairwise-rank loss "
                          "(0=off=uniform mean; recipe ~= pos_per_batch, e.g. 8). Targets the 90R tail, no new params.")
@@ -443,6 +506,10 @@ def main():
     IMG = a.img                              # override the module-level resolution used by Net/FrameDS
     a.img = IMG                              # stamp the training image size into cfg so the container reconstructs exactly
     dev = device(); print(f"device={dev} | backbone={a.backbone} | img={IMG} | cg_head={a.cg_head}")
+    # FAIL LOUD on a missing semi manifest (see --neg-list guard in load_split): a bad path used to silently disable
+    # the entire 144k-frame semi pipeline, turning a "semi" experiment into a supervised one with no warning.
+    if a.semi_manifest and not os.path.exists(a.semi_manifest):
+        raise FileNotFoundError(f"--semi-manifest {a.semi_manifest} does not exist (refusing to silently disable semi)")
     if a.holdout == "none" and a.wise_ft >= 1.0 and not a.head_only:
         print("WARNING: shipping PURE FT (--wise-ft 1.0, no OOD anchor). The recipe is --wise-ft 0.7 [--swad]; "
               "a bare invocation ships the least-robust model.", flush=True)
@@ -470,7 +537,7 @@ def main():
     mode = "HEAD-ONLY (frozen encoder linear probe)" if a.head_only else f"unfreeze last {a.unfreeze} blocks"
     print(f"train frames={len(tp)} pos={int(np.sum(tl))} | {mode} | trainable params={ntrain/1e6:.3f}M | holdout={a.holdout}")
 
-    ds = FrameDS(tp, tl, train=True, aug=a.aug, aug_config=a.aug_config)
+    ds = FrameDS(tp, tl, train=True, aug=a.aug, aug_config=a.aug_config, img=IMG)
     sampler = PosBalancedBatchSampler(tl, a.bs, pos_per_batch=a.pos_per_batch, seed=a.seed)
     dl = torch.utils.data.DataLoader(ds, batch_sampler=sampler, num_workers=6, persistent_workers=True)
     # with a balanced sampler the in-batch neg/pos ratio is ~npb/ppb (mild), NOT the ~159 dataset ratio
@@ -498,11 +565,21 @@ def main():
         import copy
         z = np.load(a.semi_manifest, allow_pickle=True)
         up, us = z["img_path"], z["suspicion"]
+        # decision is the VLM's own bucket (CONFIDENT_NEGATIVE / HARD_NEG_CANDIDATE / ABSTAIN). It is far more
+        # reliable than thresholding a suspicion score that mine_hardneg defaults to 0.0 when the VLM refused.
+        udec = z["decision"] if "decision" in z.files else np.array(["?"] * len(up))
         ridx = np.random.default_rng(a.seed).choice(len(up), min(a.semi_n * 2, len(up)), replace=False)
-        up2, us2 = up[ridx], us[ridx]
-        keep = np.array([os.path.exists(p) for p in up2])          # check only the sample, not all 168k
-        up2, us2 = up2[keep][:a.semi_n], us2[keep][:a.semi_n]
-        uds = UnlabeledDS(up2, us2, a.aug_config, aug=a.aug)
+        up2, us2, ud2 = up[ridx], us[ridx], udec[ridx]
+        keep = np.array([os.path.exists(p) for p in up2])          # check only the sample, not all 145k
+        up2, us2, ud2 = up2[keep][:a.semi_n], us2[keep][:a.semi_n], ud2[keep][:a.semi_n]
+        # confident-negative mask travels with the frame so the PU target can be decision-gated (--semi-use-decision)
+        cneg = (us2 < a.semi_lo)
+        if a.semi_use_decision:
+            cneg = cneg & (ud2 == "CONFIDENT_NEGATIVE")
+        uds = UnlabeledDS(up2, us2, a.aug_config, aug=a.aug, cneg=cneg, img=IMG)
+        import collections
+        print(f"semi pool buckets: {dict(collections.Counter(ud2.tolist()))} | conf-neg targets={int(cneg.sum())} "
+              f"({cneg.mean():.1%} of the sampled pool)")
         semi_dl = torch.utils.data.DataLoader(uds, batch_size=a.semi_bs, shuffle=True, num_workers=8,
                                               persistent_workers=True, drop_last=True, prefetch_factor=4)
         ema = copy.deepcopy(net)
@@ -520,14 +597,14 @@ def main():
         if tail and "rank" in terms:
             L = L + 0.5 * pairwise_rank_loss(logits, y, ohem_k=a.ohem_k)
         if tail and "pauc" in terms:
-            L = L + 0.5 * soft_pauc90(logits, y)
+            L = L + 0.5 * soft_pauc90(logits, y, q=a.pauc_q)
         return L
 
     swad_sum, swad_n = None, 0           # SWAD: running sum of state_dict over the last-N epochs
     semi_iter = iter(semi_dl) if semi_dl is not None else None
     best = -1
     for ep in range(a.epochs):
-        net.train(); tot = 0
+        net.train(); tot = 0; semi_tot = 0.0
         if net.head_only:
             net.backbone.eval()         # frozen encoder -> deterministic features (no drop_path/dropout noise)
         tail = ep >= a.warmup           # warm-start on BCE, then add the 90R tail terms
@@ -558,19 +635,31 @@ def main():
             if semi_dl is not None and tail and semi_w > 0:
                 for _ in range(a.semi_steps):
                     try:
-                        xw, xs, susp = next(semi_iter)
+                        xw, xs, cnegb = next(semi_iter)
                     except StopIteration:
-                        semi_iter = iter(semi_dl); xw, xs, susp = next(semi_iter)
-                    xw, xs, susp = xw.to(dev), xs.to(dev), susp.float().to(dev)   # susp collates to f64 -> f32 (MPS-safe)
+                        semi_iter = iter(semi_dl); xw, xs, cnegb = next(semi_iter)
+                    xw, xs, cnegb = xw.to(dev), xs.to(dev), cnegb.float().to(dev)  # collates to f64 -> f32 (MPS-safe)
                     with torch.autocast(device_type="cuda", enabled=amp):
                         with torch.no_grad():
-                            pt = torch.sigmoid(ema(xw))              # EMA-teacher prob on the WEAK view
+                            lt = ema(xw); pt = torch.sigmoid(lt)     # EMA-teacher logit/prob on the WEAK view
                         ls = net(xs); ps = torch.sigmoid(ls)         # student on the STRONG view
-                        semi = ((ps - pt) ** 2).mean()               # Mean-Teacher consistency (label-free -> anti-overfit)
-                        neg = susp < a.semi_lo                       # one-sided PU: confident VLM negatives -> target 0
+                        if a.semi_mode == "fixmatch":
+                            # Confidence-masked hard pseudo-label CE (Sohn 2020). Unlike the prob-space MSE below,
+                            # this keeps a real gradient once the pool saturates near 0, and it only trains on
+                            # frames the teacher is actually sure about.
+                            mask = (pt > a.semi_conf) | (pt < 1 - a.semi_conf)
+                            if mask.any():
+                                semi = nn.functional.binary_cross_entropy_with_logits(
+                                    ls[mask], (pt[mask] > 0.5).float())
+                            else:
+                                semi = ls.sum() * 0.0
+                        else:
+                            semi = ((ps - pt) ** 2).mean()           # Mean-Teacher consistency (label-free -> anti-overfit)
+                        neg = cnegb > 0.5                            # one-sided PU: confident VLM negatives -> target 0
                         if neg.any():
                             semi = semi + nn.functional.binary_cross_entropy_with_logits(ls[neg], torch.zeros_like(ls[neg]))
                         semi = (semi_w * semi) / a.semi_steps        # average over the K accumulated unlabeled batches
+                    semi_tot += float(semi.detach()) * a.semi_steps  # log what the 145k pool actually contributes
                     if amp:
                         scaler.scale(semi).backward()
                     else:
@@ -587,6 +676,11 @@ def main():
                         be.copy_(bsrc)
         sched.step()
         msg = f"ep{ep+1}/{a.epochs} loss={tot/len(dl):.4f}"
+        if semi_dl is not None:
+            # DIAGNOSTIC: the supervised loss collapses to ~1e-3 by ep8 (127 memorised positives) while the semi
+            # term is what the 145k pool contributes. If semi_loss << sup_loss the pool is decorative — this line
+            # is how you see it instead of assuming it.
+            msg += f" semi={semi_tot/max(1,len(dl)):.4f}(w={semi_w:.2f},{a.semi_mode})"
         if vam.any():
             r, s = evaluate_center(net, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
             ppv = r["ppv90"]
@@ -634,6 +728,18 @@ def main():
     if not vam.any() and not (a.swad and swad_out):     # ship: SWAD already wrote a.out; else write final net
         torch.save({"model": net.state_dict(), "cfg": vars(a)}, a.out)
         print(f"saved ship model -> {a.out}")
+    # The Mean-Teacher EMA is a temporal weight-average and is usually the better OOD model (Tarvainen & Valpola
+    # 2017); it was previously updated every step and then discarded. Save it so it can be A/B'd against the student.
+    ema_out = None
+    if a.ship_ema and ema is not None:
+        ema_out = a.out[:-3] + "_ema.pt"
+        torch.save({"model": ema.state_dict(), "cfg": vars(a), "ema_of": a.out}, ema_out)
+        print(f"saved EMA teacher -> {ema_out}")
+        if vam.any():
+            r, s = evaluate_center(ema, list(paths[vam]), list(labels[vam]), list(centers[vam]), dev, a.bs)
+            np.savez(ema_out[:-3] + "_loco.npz", y=np.array(labels[vam]), c=np.array(centers[vam]), s=s)
+            print(f"EMA LOCO-val({a.holdout}) PPV@90R={r['ppv90']:.4f} AUROC={r['auroc']:.3f} "
+                  f"AUPRC={r['auprc']:.3f}  (compare to the student's best-epoch above)")
     print(f"best LOCO-val AUPRC (selection metric) = {best:.4f}")
 
     # WiSE-FT: interpolate the saved backbone toward the SSL init (robustness; pick alpha on inner val).
@@ -651,6 +757,8 @@ def main():
     apply_wise_ft(a.out)
     if swad_out and swad_out != a.out:
         apply_wise_ft(swad_out)
+    if ema_out:
+        apply_wise_ft(ema_out)
 
 
 if __name__ == "__main__":

@@ -67,7 +67,17 @@ def fpr90(y,s,R=.9):
     if P==0 or Nn==0: return np.nan
     o=np.argsort(-s,kind="mergesort"); ys=y[o]; tp=np.cumsum(ys); fp=np.cumsum(1-ys); rc=tp/P
     return fp[min(np.searchsorted(rc,R),len(rc)-1)]/Nn
-def ppv1(f): return np.nan if np.isnan(f) else .01/(.01+.99*f)   # 1% prevalence (was .009 — prevalence bug)
+def ppv1(f, R=.9):
+    """PPV at the organizers' operating point, from the FPR at recall R.
+
+    RARE26 (rare26.grand-challenge.org/task-evaluation): ALL non-dysplastic images are retained in every bootstrap
+    iteration and neoplasia images are resampled WITH REPLACEMENT to a 1:100 count ratio. So with n_neg negatives:
+        TP = R * n_pos = R * n_neg/100      FP = FPR * n_neg
+        PPV = R / (R + 100*FPR)
+    The previous `.01/(.01+.99*f)` DROPPED the recall factor R from the numerator (overstating PPV ~10%); the one
+    before it, `.009/(.009+.99*f)`, had R but modelled a 1% mixture rather than the 1:100 count ratio (~1% error).
+    """
+    return np.nan if np.isnan(f) else R / (R + 100. * f)
 def auc(y,s): return roc_auc_score(y,s) if len(set(y))>1 else float("nan")
 def boot_ppv(y,s,B=1000):
     rng=np.random.RandomState(0); n=len(y); out=[]

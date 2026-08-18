@@ -34,6 +34,7 @@ GPU (cloud). Device-portable; MPS-runnable for a smoke. Reads phase3/cache/conce
 """
 from __future__ import annotations
 import argparse
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -127,7 +128,14 @@ class ConceptDS(torch.utils.data.Dataset):
         try:
             im = self.tf(Image.open(self.paths[i]).convert("RGB"))
         except Exception:
-            im = Image.new("RGB", (IMG, IMG))
+            # DO NOT silently substitute a black frame. This used to swallow every failure, so a target matrix
+            # whose paths don't resolve on THIS machine (e.g. a Drive-cached npz built locally with
+            # `dataset/train/...png` paths, unzipped on Colab where only `out/` exists) trained the encoder to map
+            # a BLACK IMAGE to real concept targets — for 30 epochs, on the 2,476 labeled frames incl. all 127
+            # positives. main() preflights this, so reaching here means a genuinely corrupt file.
+            raise RuntimeError(
+                f"ConceptDS: cannot read {self.paths[i]!r}. Refusing to train on a blank substitute — "
+                f"rebuild the target matrix on this machine (`python -m phase3.build_concept_targets`).")
         x = (torch.from_numpy(np.asarray(im.resize((IMG, IMG)), np.float32).copy()).permute(2, 0, 1) / 255. - _MEAN) / _STD
         return x, torch.from_numpy(self.value[i].copy()), torch.from_numpy(self.sup[i].copy())
 
@@ -228,7 +236,25 @@ def priors_and_posw(value, sup, pos_weight_cap):
 
 
 def main():
+    global IMG                               # --img overrides the resolution used by ConceptNet/ConceptDS
     ap = argparse.ArgumentParser()
+    ap.add_argument("--img", type=int, default=IMG,
+                    help="Stage-1 input resolution. MUST match the Stage-2 --img you will fine-tune at, or the "
+                         "concept encoder is trained on a different token grid than it is consumed at (pos_embed is "
+                         "interpolated at load, but the blocks were adapted to the other scale). featurize.IMG was "
+                         "flipped 336->448 for the dinov3 era (commit f4271e2), so any Stage-1 built since then "
+                         "silently ran @448 while the winning ship runs @336 — pass 336 for the dinov2 recipe.")
+    ap.add_argument("--holdout", default="none",
+                    help="LEAK GUARD for LOCO gating. concept_targets.npz contains the 2,476 LABELED train frames "
+                         "(127 pos / 2,349 neg, center_1 1823 / center_2 653) alongside the 167,724 unlabeled ones. "
+                         "Stage-1 never reads the binary label, but it DOES distil concepts that are 0.87-0.91 AUROC "
+                         "proxies for it (mucosal_irregularity, demarcation, nodularity) on those exact images — so a "
+                         "`finetune --holdout center_2 --init concept_encoder.pt` LOCO run evaluates on frames the "
+                         "encoder was trained on for 30 epochs with label-correlated targets. That makes EVERY "
+                         "concept-init LOCO number optimistic, including --loco-no-semi runs. "
+                         "'center_1'/'center_2' = drop that center's labeled frames; 'labeled' = drop all 2,476 "
+                         "(1.5% of the corpus) for ONE encoder that is honest for BOTH legs; 'none' = ship setting "
+                         "(correct: the hidden test was never in Stage-1, so the leaderboard is unaffected).")
     ap.add_argument("--targets", default="phase3/cache/concept_targets.npz")
     ap.add_argument("--out", default="phase3/cache/concept_encoder.pt")
     ap.add_argument("--backbone", choices=["dinov2", "dinov3"], default="dinov3",
@@ -254,10 +280,21 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="debug subset")
     ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args()
-    dev = device(); print(f"device={dev}")
+    IMG = a.img                              # override before ConceptNet/ConceptDS read the module global
+    dev = device(); print(f"device={dev} | img={IMG} (Stage-2 --img MUST match this)")
 
     D = np.load(a.targets, allow_pickle=True)
     paths, value, sup = D["paths"], D["value"], D["supervise"]
+    if a.holdout != "none":
+        # Drop labeled frames so a LOCO gate is not evaluated on images this encoder was trained on.
+        # Labeled rows are exactly those with a non-empty `center` (the 167,724 unlabeled ones have center == "").
+        cen = D["center"].astype(str)
+        drop = (cen != "") if a.holdout == "labeled" else (cen == a.holdout)
+        keep = ~drop
+        print(f"LEAK GUARD --holdout {a.holdout}: dropped {int(drop.sum())} labeled frames "
+              f"({int(drop.sum())/len(paths):.2%} of the corpus) -> {int(keep.sum())} remain. "
+              f"Use this encoder ONLY for gating; the ship encoder must be --holdout none.")
+        paths, value, sup = paths[keep], value[keep], sup[keep]
     main_idx, center_idx, aux_idx, role_w35, dead = route_concepts(value, sup, a.discrim, a.context_route)
     prior35, posw35 = priors_and_posw(value, sup, a.pos_weight_cap)
     if a.limit and a.limit < len(paths):
@@ -271,6 +308,24 @@ def main():
                               rng.choice(rest, n_rest, replace=False)])
         paths, value, sup = paths[sel], value[sel], sup[sel]
         print(f"stratified subset: {n_pos} graded-positive-like + {n_rest} other")
+    # PREFLIGHT: verify the target matrix's paths actually resolve HERE. A matrix built on another machine (or
+    # restored from Drive) can carry paths that do not exist in this environment; the old blank-image fallback
+    # made that invisible and silently poisoned Stage-1. Check the labeled rows in full (they are few and carry
+    # the strongest, most label-correlated supervision) plus a sample of the rest.
+    _cen = D["center"].astype(str)
+    if a.holdout != "none":
+        _cen = _cen[keep]
+    _lab_idx = np.where(_cen != "")[0]
+    _chk = np.unique(np.concatenate([_lab_idx, np.arange(0, len(paths), max(1, len(paths) // 2000))]))
+    _missing = [paths[i] for i in _chk if not os.path.exists(paths[i])]
+    if _missing:
+        raise FileNotFoundError(
+            f"{len(_missing)} of {len(_chk)} checked concept-target paths do not exist here "
+            f"(e.g. {_missing[:3]}). This matrix was built elsewhere — on Colab the labeled rows are stored as "
+            f"'dataset/...' but only 'out/' is unzipped, so Stage-1 would have trained {len(_lab_idx)} labeled "
+            f"frames (incl. every positive) as BLANK images. Rebuild it here: "
+            f"`python -m phase3.build_concept_targets --out {a.targets}`")
+    print(f"preflight OK: {len(_chk)} sampled paths resolve ({len(_lab_idx)} labeled rows checked in full)")
     nm = lambda idx: [CONCEPT_NAMES[i] for i in idx]
     print(f"frames={len(paths)}")
     print(f"MAIN (grad->trunk) [{len(main_idx)}]: {nm(main_idx)}")

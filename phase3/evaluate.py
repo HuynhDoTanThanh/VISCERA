@@ -87,12 +87,62 @@ def auc_metrics(y, s):
     return dict(auroc=float(roc_auc_score(y, s)), auprc=float(average_precision_score(y, s)))
 
 
+def bootstrap_challenge(y, s, target=0.9, ratio=100, B=1000, seed=12345):
+    """EXACT RARE26 estimator (rare26.grand-challenge.org/task-evaluation, verified 2026-08).
+
+    The organizers: keep ALL non-dysplastic images in every iteration (negatives are NEVER resampled), sample
+    neoplasia images WITH REPLACEMENT to a fixed 1:`ratio` count ratio, read precision at the threshold where
+    recall first reaches `target`, repeat B times, report the MEDIAN (95% CI = 2.5/97.5 percentiles).
+
+    This differs from bootstrap() above in two ways that matter:
+      * bootstrap() RESAMPLES negatives (with replacement, center-stratified) and fixes n_pos = len(pos), then
+        synthesises 99*n_pos negative draws. The organizers do the opposite — negatives fixed, positives drawn.
+      * bootstrap()'s extra negative-resampling variance inflates the apparent noise floor of PPV@90R, which is
+        part of why §6 read the metric as "noise-dominated".
+    Kept as a SEPARATE function so every historical number from bootstrap() stays comparable.
+
+    Identity worth remembering:  PPV@90R = target / (target + ratio * FPR@90R).
+    """
+    y = np.asarray(y); s = np.asarray(s)
+    rng = np.random.default_rng(seed)
+    pos = np.where(y == 1)[0]; neg = np.where(y == 0)[0]
+    if len(pos) == 0 or len(neg) == 0:
+        return dict(median=np.nan, lo=np.nan, hi=np.nan, n_pos_draw=0, n_neg=len(neg), B=0)
+    n_draw = max(1, int(round(len(neg) / ratio)))       # positives resampled to hit the 1:ratio count ratio
+    # QUANTIZATION CAVEAT: with n_draw positives, "first index with recall>=target" needs tp >= ceil(target*n_draw),
+    # so the EFFECTIVE recall is ceil(target*n_draw)/n_draw. On a small local set that is far above `target`:
+    #   588 negs -> 6 draws  -> effective recall 1.000 (this is PPV@100R, NOT PPV@90R)
+    #  2937 negs -> 29 draws -> 0.931
+    # 23000 negs -> 230 draws -> 0.900 (the real test: exact)
+    # So this estimator is only faithful on large sets. Do not rank recipes with it on a 619-frame val.
+    eff = int(np.ceil(target * n_draw)) / n_draw
+    if abs(eff - target) > 0.02:
+        print(f"[bootstrap_challenge] WARNING: {len(neg)} negatives -> only {n_draw} positive draws, so the "
+              f"recall>={target} point quantizes to an EFFECTIVE recall of {eff:.3f}. This number is not "
+              f"comparable to the leaderboard; use AUROC/AUPRC to rank recipes on a set this small.")
+    y_neg = np.zeros(len(neg), dtype=int); s_neg = s[neg]
+    vals = np.empty(B)
+    for b in range(B):
+        pi = rng.choice(pos, n_draw, replace=True)
+        yb = np.concatenate([np.ones(n_draw, dtype=int), y_neg])
+        sb = np.concatenate([s[pi], s_neg])
+        vals[b] = ppv_curvepoint(yb, sb, target)
+    vals = vals[~np.isnan(vals)]
+    if not len(vals):
+        return dict(median=np.nan, lo=np.nan, hi=np.nan, n_pos_draw=n_draw, n_neg=len(neg), B=0)
+    return dict(median=float(np.median(vals)), lo=float(np.percentile(vals, 2.5)),
+                hi=float(np.percentile(vals, 97.5)), n_pos_draw=n_draw, n_neg=len(neg), B=len(vals))
+
+
 def report_full(y, s, center=None, target=0.9, prevalence=0.01, B=2000, seed=12345):
     """The 5 trusted numbers in one call: PPV@{target}R (bootstrap median) + 95% CI [lo,hi] at `prevalence`,
     plus AUROC + AUPRC. Returns a flat dict; callers just format it."""
     b = bootstrap(y, s, center, target=target, prevalence=prevalence, B=B, seed=seed)["curve"]
     a = auc_metrics(y, s)
+    gc = bootstrap_challenge(y, s, target=target, B=min(B, 1000), seed=seed)   # the organizers' exact estimator
     return dict(ppv90=b.get("median", float("nan")), ci_lo=b.get("lo", float("nan")), ci_hi=b.get("hi", float("nan")),
+                ppv90_gc=gc["median"], gc_lo=gc["lo"], gc_hi=gc["hi"],
+                fpr90=fpr_at_recall(np.asarray(y), np.asarray(s), target),
                 auroc=a["auroc"], auprc=a["auprc"], n=int(len(y)), pos=int((np.asarray(y) == 1).sum()))
 
 

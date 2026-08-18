@@ -248,3 +248,270 @@ WiSE-FT mixing (correct two states, direction, in-place save), pos/neg sampler, 
 The 288k semi-consistency **strong view** is `a.aug`-dependent: at `mild` it is **geometric** RandAugment, which does NOT perturb the per-center **color** axis (the 0.996-separability root disease). Only `--aug domain` makes it AcquisitionAug (white-balance+HSV+FDA+gamma). So at the winning resolution (@336, `aug=mild`), the 300k pool has only ever taught geometric invariance — its cross-center generalization power was never engaged. Supervised loss →0.0006 by ep8 (memorizes the 127 positives); semi + WiSE-FT are the only regularizers, so pointing them at the color axis is the lever. **exp6 = exps/2 @336 + `--aug domain`** (one change vs the best) engages both the labeled color-randomization AND the 288k color-consistency = the winner's color-aug lever, never tried at @336. Gate it leak-free with `--loco-no-semi` (notebook cell) before submitting.
 
 **Bottom line:** the pipeline is mechanically sound (no score-capping bug in the ship path); the real defects were (1) a leaked LOCO compass that mis-guided our lever selection and (2) the 300k pool teaching the wrong invariance at @336. exp6 fixes (2); `--loco-no-semi` + `loco_probe.py` fix (1) so future gating is honest.
+
+---
+
+## 10. DEEP REVIEW (2026-08-18) — the metric is RANK-ONLY, CG-AMIL was never trained, and exp6 was confounded
+
+10 parallel review agents over every subsystem + web verification of the challenge rules. Four findings change what
+we should do; three earlier conclusions in this document are **retracted**.
+
+### 10.0 CALENDAR — the ranking event is 8 days after open-dev closes *(verified on grand-challenge.org)*
+| phase | dates | submissions |
+|---|---|---|
+| Open Development | → **Aug 31 2026 EoD** | leaderboard practice only — **not the final ranking** |
+| **Closed Testing** | **Sept 1–7 2026** | **ONE per team**, "only the most recent will be evaluated" |
+| Report | → Sept 14 2026 | 2–3 pages |
+
+**The open-dev board score (exps/2 = 0.0177, top-1 0.0271) does not decide anything.** Every remaining open-dev slot
+should be spent *validating the container we will upload once in September*. Also verified: `phases-rules/` requires
+**code published under the MIT license to be eligible for the final leaderboard** — `RARE25-Submission/LICENSE` is
+currently **CC-BY-NC-4.0**, an eligibility blocker. External data + public pretrained models are explicitly allowed
+with disclosure. No rule restricts test-time/transductive methods.
+
+### 10.1 MECHANISM — PPV@90R depends ONLY on the rank order of our scores
+From `rare26.grand-challenge.org/task-evaluation/`, verbatim: *all* non-dysplastic images are retained in every
+iteration; neoplasia images are *"sampled with replacement… targeting a ratio of one neoplasia case per 100
+non-neoplasia cases"*; PPV is read *"at the threshold where Recall = 0.90"*; 1000 iterations; **median**.
+
+The organizers **re-derive the threshold from our own scores**. Therefore **any strictly monotone transform of the
+final per-frame score leaves PPV@90R, AUROC and AUPRC exactly unchanged.** With all negatives kept and positives
+resampled to `n_neg/100`:
+
+> **PPV@90R = 0.9 / (0.9 + 100 · FPR@90R)**  ⇒  **FPR@90R = 0.009·(1/PPV − 1)**
+
+| run | PPV@90R | ⇒ FPR@90R |
+|---|---|---|
+| exps/2 (ours) | 0.0177 | **0.50** — half of all new-center negatives outrank our bottom-decile positive |
+| RARE25 winner (IMSY) | 0.035 | **0.25** |
+
+**The whole task is: halve FPR@90R.** This retires a queue item and reframes §4:
+
+- ❌ **RETRACTED — queue #2 "affine→1% recalibration" is an exact no-op.** Platt, temperature, sigmoid recal,
+  whole-set quantile-matching, "overshoot recall at inference" — all monotone, all provably zero. This also explains
+  §5's puzzle ("single-center de-floor: raw == de-floor exactly") — de-floor is monotone *within* a center.
+- ❌ **RETRACTED — §4's "score-shift, not ranking" diagnosis is a category error.** A shift of our score
+  distribution cannot move a threshold that adapts to our scores. The problem *is* ranking — specifically the deep
+  tail: too many new-center negatives beat our weakest positives.
+- ✅ Calibration is only real **pre-fusion, per-member** (it re-weights members inside an average — which is
+  non-monotone overall). That is what IMSY's "post-hoc calibration" must mean, and it is the version worth copying.
+
+### 10.2 BUG (critical) — `--cg-head` attention has **never been trained**, in any run
+`layerwise_param_groups()` built optimizer groups from `backbone.blocks`, `backbone.norm` and `head` only. `net.attn`
+(the gated attention-MIL pooling, **196,736 params**) is a *sibling* of `head` and was in **no** param group, so AdamW
+never updated it. Verified by executing the pre-fix code: gradients are produced, `optimizer=42.5426M` vs
+`trainable=42.7393M`, and the attention weights are **bit-identical after an optimizer step**.
+
+**Consequence: exps/3 and exps/4 shipped a randomly-initialised, frozen attention pooling.** Every "CG-AMIL
+regressed → retire attention-MIL" verdict in §C, §1 and the queue measured *random projections*, not attention-MIL.
+The frozen-backbone ablation that liked attention (LOCO 0.943 vs mean 0.929) used a *different* code path and stands.
+**Fixed** (+ an assert that every trainable tensor is in the optimizer). The CG-AMIL verdict is now **un-tested**, not
+negative — but it is a ranking-side lever, so it is not top priority given §10.1.
+
+### 10.3 CONFOUND (critical) — exp6 as written was **not** "exps/2 + one variable"
+`pretrain_concept.py` had **no `--img` flag** and inherited `IMG` from `featurize.py`, which was flipped **336→448**
+in commit `f4271e2`. exps/2 predates that commit (its cfg has no `img`/`backbone` key at all), so **exps/2's concept
+encoder is @336**. Any Stage-1 built today runs **@448**, and the Drive cache key was `concept_encoder_{BACKBONE}.pt`
+— **no resolution in the name** — so exp6 would have loaded a 448-trained encoder under a @336 ship: a second,
+uncontrolled variable, and it is precisely the variable §8 identified as the killer.
+
+**Fixed:** `--img` added to `pretrain_concept.py` (stamped into cfg), notebook pins one `FT_IMG = 336` used by both
+stages, the Drive cache key is now `concept_encoder_{BACKBONE}_{FT_IMG}.pt`, legacy unversioned encoders are refused,
+and `finetune.py` warns loudly on any Stage-1/Stage-2 resolution mismatch.
+
+### 10.4 BUG — the §9 "prevalence fix" was itself a regression
+`loco_probe.py` `ppv1()` was changed to `.01/(.01+.99f)`, which **drops the recall factor** from the numerator
+(overstates PPV ~10%). The original `.009/(.009+.99f)` was right. Now corrected to the organizers' exact
+definition, `R/(R + 100·FPR)`. §9 BUG 2 is **retracted**.
+
+### 10.5 THE UNLABELED POOL — the real reason experiments feel weak
+Measured from `phase3/cache/unl_manifest.npz`:
+
+| | |
+|---|---|
+| actual pool | **144,887 frames** — the "288k manifest"/"300k pool" in §9 and the notebook are **double-counted**; `--semi-n 300000` is a non-binding cap |
+| buckets | CONFIDENT_NEGATIVE 107,476 · **HARD_NEG_CANDIDATE 31,012** · ABSTAIN 6,399 |
+| fields available | `name, dir, img_path, suspicion, decision, frame_trust` |
+| fields Stage-2 reads | **`img_path` + `suspicion` only** (2 of 6) |
+| coverage/epoch (ship flags) | 26 labeled batches × 10 semi-steps × 256 = **66,560 views** ≈ 4.6 passes over the run |
+
+Coverage is **not** the bottleneck — signal *quality* is:
+
+1. **The consistency loss self-extinguishes.** `((ps-pt)**2).mean()` in *probability* space: once the PU term drives
+   65% of the pool to saturated-negative logits, this term is ~1e-4 and the 145k frames stop contributing gradient
+   while still consuming ~90% of the compute. Only ~312 optimizer steps exist in the whole run (26 × 12).
+2. **The 31,012 HARD_NEG_CANDIDATE frames — the exact FP-tail population that sets FPR@90R — receive no
+   discriminative signal at all.** The only target is `suspicion < 0.15`, which excludes them by construction.
+3. **The model-in-the-loop hard-FP miner is coded and has never been used** — no ship command passes `--neg-list`.
+4. **The EMA teacher is built, updated every step, then discarded**; the student is shipped.
+5. `suspicion` defaults to 0.0 when the VLM refused, so ABSTAIN frames were hard-taught as confident negatives —
+   exactly where unlabeled positives hide.
+6. Center is *not* in the manifest, but **`dir` is** — so the pool *can* be pseudo-center-labeled, which would let
+   LOCO keep semi ON honestly instead of dropping it (`--loco-no-semi` is blind to exp6's own mechanism).
+
+**Shipped fixes (all default-off except the guards):** `--semi-mode fixmatch` (confidence-masked pseudo-label CE),
+`--semi-use-decision` (gate the PU target on the VLM `decision` field), `--ship-ema`, `--pauc-q`, a per-epoch `semi=`
+loss print, and hard failures on a missing `--semi-manifest`/`--neg-list` (these used to disable the pool silently).
+
+### 10.6 TAIL OBJECTIVE — we optimise PPV@80R, not PPV@90R
+`soft_pauc90` defends `quantile(pos, q=0.2)` — the **20th**-percentile positive — while the metric thresholds at the
+**10th**. There is no trained margin where the score is actually read. `--pauc-q` added; run at `0.0625–0.10` with
+`--pos-per-batch 16` (needed to estimate the deeper quantile).
+
+### 10.7 CONTAINER
+- ⚠ **`RARE25-Submission/resources/ship_seed*.pt` are byte-identical to exps/5** (md5 `f6b3707…`) — the **worst**
+  run (AUROC 0.797). A `do_build.sh` today ships the regressed model.
+- ✅ Resolution parity is sound: `viscera_model.py` reads `img` from each checkpoint's cfg (`DEFAULT_IMG=448` is only
+  a fallback), so a @336 ship serves at 336. `ENSEMBLE='prob'` and `SCORE_ALIGN_Q=None` are the correct settings —
+  `ENSEMBLE='rank'` would compute ranks *within* a ~16-frame stack and destroy the pooled ranking. Keep both.
+- The container is invoked **per stack** (the test fixture is a 16-frame stacked TIFF), so per-stack transductive
+  tricks cannot cancel a systematic center shift — they only inject cross-stack ranking noise. Consistent with §7.
+
+### 10.8 DOC CORRECTION — GastroNet did *not* underperform in RARE25
+`RARE26_STUDY_PLAN.md:240` claims "in RARE25 the in-domain GastroNet pretrain underperformed ImageNet". The official
+RARE25 results page says the **winner (IMSY) used a GastroNet-pretrained ResNet-50** plus a LoRA-finetuned DINOv3
+ViT-Large, "extensive ensembling, and post-hoc calibration", and that top solutions "relied on pretraining and
+ensembling rather than single-model approaches". The decision to demote continued-SSL/DAPT to a "research bet" rests
+on a false premise and should be revisited.
+
+### 10.9 REVISED QUEUE (ranked by EV against `FPR@90R = 0.50 → 0.25`, with 14 open-dev days)
+| # | item | why it can move a **rank** metric | cost |
+|---|---|---|---|
+| 0 | **Relicense to MIT; stage exps/2 (not exps/5) in `resources/`** | eligibility + not shipping the worst model | minutes |
+| 1 | **exp6 @336 + aug-domain, now un-confounded** (Stage-1 rebuilt @336) | attacks the color axis that inflates new-center FPs; the run as previously configured was invalid | 1 ship |
+| 2 | **Hard-FP mining → `--neg-list`** (`mine_hardneg --score-with` exists, never used) | directly deletes FP mass above τ₉₀ₐ; morphology-driven ⇒ transfers | tiny |
+| 3 | **`--pauc-q 0.0625 --pos-per-batch 16`** | trains the margin where the metric is actually read | tiny |
+| 4 | **`--semi-mode fixmatch --semi-use-decision`** | makes 145k frames contribute non-vanishing gradient | tiny |
+| 5 | **Per-member normalisation *before* prob-fusion** (the only legitimate reading of IMSY's calibration) | non-monotone ⇒ real; rank-preserving no-ops are not | small |
+| 6 | **GastroNet ResNet-50 member** (public: `huggingface.co/tgwboers/GastroNet-5M_Pretrained_Weights`) | the winner's other family; genuine decorrelation, unlike our ConvNeXt | medium |
+| 7 | **Train the final closed-phase model on train+val** (+31–48 positives, ≈ +25%) | positives are the binding constraint; val is ordinary challenge training data | small |
+| 8 | Pseudo-center-label the pool via `dir` → honest LOCO **with semi ON** | today no semi lever can be gated at all | small |
+| ~~x~~ | ~~affine→1% recalibration~~ | **provably zero** (§10.1) | — |
+| ~~x~~ | ~~"CG-AMIL is retired"~~ | **verdict void** (§10.2) — never actually trained | — |
+
+**Bottom line:** the pipeline is not weak because the ideas are wrong; it is weak because three of the levers were
+never actually running (attention untrained, hard-FP miner unused, semi loss self-extinguishing), one experiment was
+silently confounded (Stage-1 @448), and the single lever ranked #2 in the queue is mathematically incapable of
+changing the score. Fix those and the remaining budget buys real experiments.
+
+---
+
+## 11. Follow-up audit — Stage-1 contaminates every LOCO gate; the local metric is not the challenge metric
+
+Two claims left unverified in §10 (their verifier tier died on a usage limit). Both confirmed by direct inspection.
+
+### 11.1 LEAK — `--loco-no-semi` is **not** leak-free when `--init concept_encoder.pt` is used
+`concept_targets.npz` (170,200 rows) contains, alongside 167,724 unlabeled frames, **all 2,476 LABELED train
+frames** with real `center` tags (center_1 1823 / center_2 653) — verified:
+
+```
+label values : {-1: 167724, 0: 2349, 1: 127}
+center values: {'': 167724, 'center_1': 1823, 'center_2': 653}
+```
+
+Stage-1 never reads the binary `label` (it consumes only `paths/value/supervise`), so this is **not** a label leak.
+But it distils concepts that are **0.87–0.91 AUROC proxies for the neo label** (`mucosal_irregularity` 0.905,
+`demarcation` 0.870, `nodularity` 0.869 — our own §3.5 table) **on the exact images the LOCO leg then evaluates
+on**, for 30 epochs. So every concept-initialised LOCO number is optimistic — including the `--loco-no-semi`
+compass and the exp6 aug-gate in the notebook, which we were about to trust to decide the submission.
+
+Structurally identical to §9 BUG 1: **the ship is unaffected** (the hidden test was never in Stage-1, so all LB
+scores stand) — only the local compass lies. **Fixed:** `pretrain_concept.py --holdout {center_1|center_2|labeled}`
+drops labeled frames by their `center` field (the unlabeled ones have `center == ""`, so the filter is exact):
+
+| `--holdout` | frames kept | dropped |
+|---|---|---|
+| `none` (**ship**) | 170,200 | 0 |
+| `center_1` | 168,377 | 1,823 |
+| `center_2` | 169,547 | 653 |
+| `labeled` | 167,724 | 2,476 (1.5%) |
+
+**Recommended gating protocol:** build ONE encoder with `--holdout labeled` (costs 1.5% of the corpus, honest for
+*both* legs, one extra Stage-1 run instead of two) and use it for every gate. Ship with `--holdout none`.
+
+### 11.2 The local harness does not implement the organizers' estimator
+`evaluate.py:_resample_idx` fixes `npos = len(pos)` and synthesises `99·npos` negatives **by resampling the negative
+pool with replacement**. The organizers do the opposite: **all negatives retained, never resampled**; positives drawn
+with replacement to `n_neg/100`. Two consequences: our PPV@90R is not on the same scale as the LB, and the extra
+negative-resampling variance **inflates the apparent noise floor** — part of why §6 read PPV@90R as
+"noise-dominated". Added `evaluate.bootstrap_challenge()` (exact scheme) as a **separate** function so every
+historical `bootstrap()` number stays comparable; `report_full` now also returns `ppv90_gc` and `fpr90`.
+
+A useful side-effect: on our 619-frame val the exact scheme draws only **6 positives per iteration** (588/100), which
+is why local PPV@90R is so jumpy. On the real test (RARE25 scale ≈ 23k NDBE) it draws ~230 — **the leaderboard metric
+is far better conditioned than our local proxy.** Read AUROC/AUPRC locally; do not over-read local PPV@90R swings.
+
+### 11.3 FULL-POWER final ship (new notebook cell, after the exp6 cell)
+For the one closed-phase container, every source of signal is legitimate — the hidden test is in none of it:
+
+| source | train-only ship (exps/2 / exp6) | **full-power ship** |
+|---|---|---|
+| labeled | 2,476 / **127 pos** | **3,095 / 158 pos** (+ val's 619 source frames = **+24% positives**) |
+| optimizer steps / epoch | 26 | ~74 (more negatives ⇒ more batches) |
+| semi pool | 144,887, prob-MSE (self-extinguishing) | 144,887, **fixmatch + decision-gated PU** |
+| hard negatives | none (`--neg-list` never used) | **3,000 model-mined FPs** — the exact tail the metric reads |
+| tail loss | `q=0.2` (⇒ PPV@80R) | **`--pauc-q 0.0625 --pos-per-batch 16 --ohem-k 16`** |
+| weights | best-epoch ×3 seeds | best-epoch + **SWAD** + **EMA teacher** ×3 seeds |
+
+`out/val/labels` is already de-augmented (619 source frames, 31 pos), so folding it in does **not** reintroduce the
+8× augmentation leak; the cell also hash-dedups by path.
+
+⚠ **Sequencing is mandatory:** this trains on val, so val can no longer measure anything. Freeze the recipe on the
+train-only gates (with an `--holdout labeled` concept encoder, §11.1) **first**; run the full-power cell last.
+
+---
+
+## 12. Review-of-the-review (2026-08-18) — one self-correction, one worse bug found underneath
+
+Adversarial re-check of §10–§11. Two findings survived unchanged, one needed correcting, and the correction
+uncovered a **silent training corruption on Colab** that is probably the single biggest reason experiments felt weak.
+
+### 12.1 SELF-CORRECTION — `bootstrap_challenge()` is not usable on our val set
+My own §11.2 addition quantizes badly at small n. With `n_draw` positives, "first index with recall ≥ 0.9" needs
+`tp ≥ ceil(0.9·n_draw)`, so the **effective** recall is:
+
+| negatives | positive draws | effective recall |
+|---|---|---|
+| 588 (our val) | 6 | **1.000** — this is PPV@100R, not PPV@90R |
+| 2,937 (train+val) | 29 | 0.931 |
+| 23,000 (real test) | 230 | **0.900** — exact |
+
+So the exact estimator is faithful only on large sets. It now prints a loud warning when effective recall deviates
+>0.02 from target. **Do not rank recipes with it locally — use AUROC/AUPRC.** (§11.2's headline still stands: the
+LB metric is better conditioned than our local proxy.)
+
+### 12.2 The Stage-1 contamination of §11.1 is REAL — and worse than described
+Re-verified at frame level: the 2,476 labeled rows in `concept_targets.npz` are **name-identical to 2,476/2,476 of
+the LOCO eval frames**, and carry **25.5 supervised concepts each** (not masked). So §11.1 stands.
+
+But the paths are stored as `dataset/train/<class>/<id>.png` — **not** `out/train/images/*.jpg`.
+
+### 12.3 NEW (critical) — on Colab, Stage-1 trains the labeled frames as BLACK IMAGES
+`ConceptDS.__getitem__` wrapped the image read in `try/except Exception` and substituted
+`Image.new("RGB", (IMG, IMG))` — a **black frame** — then trained on it with the real concept targets. Meanwhile:
+
+- the notebook extracts **only `out/`**; it never creates `dataset/`;
+- cell 6 **preferred the Drive-cached** `concept_targets.npz` over rebuilding.
+
+⇒ If the Drive copy was built on the laptop (paths under `dataset/`), then **every Colab Stage-1 run trained all
+2,476 labeled frames — including all 127 positives — as identical black images mapped to real clinical concept
+targets, for 30 epochs**, with no error and no log line. That is simultaneously (a) pure label-correlated noise
+injected into the encoder and (b) total waste of the highest-value supervision in the corpus.
+
+It also **inverts §11.1 for Colab runs**: frames that were never actually loaded cannot leak. Which bug you had
+depends on where the matrix was built — and nothing recorded that. Both are now impossible:
+
+| fix | file |
+|---|---|
+| blank-image fallback → hard `RuntimeError` | `pretrain_concept.py:ConceptDS` |
+| preflight: all labeled rows + ~2k sampled rows must resolve, else `FileNotFoundError` with the rebuild command | `pretrain_concept.py:main` |
+| cell 6 validates paths and **rebuilds** instead of reusing an unusable cache | notebook |
+| `--holdout labeled` gating encoder wired into **both** gate cells | notebook cells 8/10/13 |
+
+Verified: preflight passes locally (4,450 paths checked, 2,476 labeled in full), and on a matrix with Colab-style
+unresolvable paths it fails with the exact diagnosis instead of training on blanks.
+
+### 12.4 Unchanged after re-check
+The AttnPool optimizer bug (§10.2, proven by execution), the rank-only metric (§10.1, algebraic), the
+Stage-1/Stage-2 resolution split (§10.3), the `--img`-under-spawn bug, and the pool-signal findings (§10.5) all
+survive. Gate cell 10 additionally never passed `--loco-no-semi` at all and ran `@448`; both fixed.

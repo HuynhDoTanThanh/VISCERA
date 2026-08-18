@@ -48,7 +48,7 @@ def _score_finetuned(pt_paths, paths, bs=32, tta="hflip"):
         ft.IMG = int(cfg.get("img", ft.IMG))
         net = Net(cfg.get("unfreeze", 4), cg_head=cfg.get("cg_head", False), backbone=cfg.get("backbone", "dinov2")).to(dev)
         net.load_state_dict(ckpt["model"]); net.eval()
-        ds = FrameDS(list(paths), [0] * len(paths), train=False)
+        ds = FrameDS(list(paths), [0] * len(paths), train=False, img=ft.IMG)   # explicit: spawn-safe, matches this ckpt
         dl = torch.utils.data.DataLoader(ds, batch_size=bs, num_workers=0)
         out = []
         with torch.no_grad():
