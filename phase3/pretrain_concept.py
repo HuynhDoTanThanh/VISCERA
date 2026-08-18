@@ -113,8 +113,13 @@ class ConceptDS(torch.utils.data.Dataset):
     """Yields (x, value[35], supervise[35]). Routing/weighting/pos_weight are applied in the loss (so the
     same batch feeds all three heads by index-slice)."""
 
-    def __init__(self, paths, value, sup, train=True):
+    def __init__(self, paths, value, sup, train=True, img=None):
         self.paths = paths; self.value = value; self.sup = sup
+        # Capture the resolution HERE (parent process) instead of reading the module global inside __getitem__.
+        # main() rebinds IMG via `global IMG`, but DataLoader workers started with *spawn* (macOS) re-import this
+        # module and see featurize.IMG (448), so --img silently did not reach the data pipeline off-Linux.
+        # Colab/Linux uses fork, which inherits the rebound value — which is why real runs were unaffected.
+        IMG = self.img = int(img) if img is not None else globals()["IMG"]
         self.tf = T.Compose([
             T.RandomResizedCrop(IMG, scale=(0.6, 1.0), ratio=(0.85, 1.18)),
             T.RandomHorizontalFlip(), T.ColorJitter(0.35, 0.35, 0.35, 0.05),
@@ -136,7 +141,8 @@ class ConceptDS(torch.utils.data.Dataset):
             raise RuntimeError(
                 f"ConceptDS: cannot read {self.paths[i]!r}. Refusing to train on a blank substitute — "
                 f"rebuild the target matrix on this machine (`python -m phase3.build_concept_targets`).")
-        x = (torch.from_numpy(np.asarray(im.resize((IMG, IMG)), np.float32).copy()).permute(2, 0, 1) / 255. - _MEAN) / _STD
+        x = (torch.from_numpy(np.asarray(im.resize((self.img, self.img)), np.float32).copy())
+             .permute(2, 0, 1) / 255. - _MEAN) / _STD
         return x, torch.from_numpy(self.value[i].copy()), torch.from_numpy(self.sup[i].copy())
 
 
@@ -244,6 +250,10 @@ def main():
                          "interpolated at load, but the blocks were adapted to the other scale). featurize.IMG was "
                          "flipped 336->448 for the dinov3 era (commit f4271e2), so any Stage-1 built since then "
                          "silently ran @448 while the winning ship runs @336 — pass 336 for the dinov2 recipe.")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from an existing --out checkpoint (Stage-1 is ~7.5h on 291k frames @336 and "
+                         "Colab sessions drop). Restores epoch/optimizer/schedule when the checkpoint has them; "
+                         "otherwise warm-starts from its backbone weights.")
     ap.add_argument("--holdout", default="none",
                     help="LEAK GUARD for LOCO gating. concept_targets.npz contains the 2,476 LABELED train frames "
                          "(127 pos / 2,349 neg, center_1 1823 / center_2 653) alongside the 167,724 unlabeled ones. "
@@ -285,6 +295,7 @@ def main():
 
     D = np.load(a.targets, allow_pickle=True)
     paths, value, sup = D["paths"], D["value"], D["supervise"]
+    cen_cur = D["center"].astype(str)          # travels with `paths` through holdout + --limit filters
     if a.holdout != "none":
         # Drop labeled frames so a LOCO gate is not evaluated on images this encoder was trained on.
         # Labeled rows are exactly those with a non-empty `center` (the 167,724 unlabeled ones have center == "").
@@ -294,7 +305,7 @@ def main():
         print(f"LEAK GUARD --holdout {a.holdout}: dropped {int(drop.sum())} labeled frames "
               f"({int(drop.sum())/len(paths):.2%} of the corpus) -> {int(keep.sum())} remain. "
               f"Use this encoder ONLY for gating; the ship encoder must be --holdout none.")
-        paths, value, sup = paths[keep], value[keep], sup[keep]
+        paths, value, sup, cen_cur = paths[keep], value[keep], sup[keep], cen_cur[keep]
     main_idx, center_idx, aux_idx, role_w35, dead = route_concepts(value, sup, a.discrim, a.context_route)
     prior35, posw35 = priors_and_posw(value, sup, a.pos_weight_cap)
     if a.limit and a.limit < len(paths):
@@ -306,16 +317,13 @@ def main():
         n_pos = min(len(pos_like), a.limit // 2); n_rest = min(a.limit - n_pos, len(rest))
         sel = np.concatenate([rng.choice(pos_like, n_pos, replace=False),
                               rng.choice(rest, n_rest, replace=False)])
-        paths, value, sup = paths[sel], value[sel], sup[sel]
+        paths, value, sup, cen_cur = paths[sel], value[sel], sup[sel], cen_cur[sel]
         print(f"stratified subset: {n_pos} graded-positive-like + {n_rest} other")
     # PREFLIGHT: verify the target matrix's paths actually resolve HERE. A matrix built on another machine (or
     # restored from Drive) can carry paths that do not exist in this environment; the old blank-image fallback
     # made that invisible and silently poisoned Stage-1. Check the labeled rows in full (they are few and carry
     # the strongest, most label-correlated supervision) plus a sample of the rest.
-    _cen = D["center"].astype(str)
-    if a.holdout != "none":
-        _cen = _cen[keep]
-    _lab_idx = np.where(_cen != "")[0]
+    _lab_idx = np.where(cen_cur != "")[0]
     _chk = np.unique(np.concatenate([_lab_idx, np.arange(0, len(paths), max(1, len(paths) // 2000))]))
     _missing = [paths[i] for i in _chk if not os.path.exists(paths[i])]
     if _missing:
@@ -335,7 +343,7 @@ def main():
     print(f"knobs: discrim={a.discrim} context_route={a.context_route} certain_floor={a.certain_floor} "
           f"smooth_eps={a.smooth_eps} unc_w={a.unc_w} pos_weight_cap={a.pos_weight_cap}")
 
-    ds = ConceptDS(paths, value, sup, train=True)
+    ds = ConceptDS(paths, value, sup, train=True, img=IMG)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.bs, shuffle=True, num_workers=a.workers,
                                      drop_last=True, persistent_workers=a.workers > 0)
     net = ConceptNet(main_idx, center_idx, aux_idx, a.unfreeze, backbone=a.backbone).to(dev)
@@ -354,7 +362,29 @@ def main():
     ai = torch.tensor(aux_idx, dtype=torch.long, device=dev)
     kw = dict(certain_floor=a.certain_floor, smooth_eps=a.smooth_eps, unc_w=a.unc_w)
 
-    for ep in range(a.epochs):
+    # ---- RESUME: Stage-1 is ~7.5h on 291k frames @336 and Colab disconnects. Restart from the last epoch
+    # instead of losing the run. Full resume needs epoch/opt/sched/scaler (saved below); a checkpoint from an
+    # older build has only the backbone, so we warm-start from its weights and restart the schedule.
+    start_ep = 0
+    if a.resume and os.path.exists(a.out):
+        ck = torch.load(a.out, map_location="cpu", weights_only=False)
+        net.backbone.load_state_dict(ck["backbone"])
+        for h in ("main_head", "center_head", "aux_head"):
+            if h in ck:
+                getattr(net, h).load_state_dict(ck[h])
+        if "epoch" in ck:
+            start_ep = int(ck["epoch"])
+            if "opt" in ck: opt.load_state_dict(ck["opt"])
+            if "sched" in ck: sched.load_state_dict(ck["sched"])
+            if "scaler" in ck and amp: scaler.load_state_dict(ck["scaler"])
+            print(f"RESUMED from {a.out} at epoch {start_ep}/{a.epochs} (optimizer + schedule restored)")
+        else:
+            print(f"WARM-START from {a.out} (pre-resume checkpoint: backbone only, no epoch/optimizer state -> "
+                  f"the LR schedule and GRL ramp restart from 0; set --epochs to the REMAINING count)")
+        if start_ep >= a.epochs:
+            print("already complete — nothing to do"); return
+
+    for ep in range(start_ep, a.epochs):
         net.train(); tot = tm = tc = ta = 0.0; n = 0
         lam = a.grl * (2.0 / (1.0 + np.exp(-10.0 * ep / max(a.epochs - 1, 1))) - 1.0)  # DANN ramp 0->grl
         for x, v, s in dl:
@@ -376,8 +406,19 @@ def main():
             tot += loss.item(); tm += float(lm); tc += float(lc); ta += float(la); n += 1
         sched.step()
         print(f"ep{ep+1}/{a.epochs} loss={tot/n:.4f} (main={tm/n:.4f} center_grl={tc/n:.4f} aux={ta/n:.4f} lam={lam:.2f})", flush=True)
+        # save heads + optimizer/schedule/scaler + epoch so --resume can continue exactly (Stage-1 is ~7.5h)
         torch.save({"backbone": net.backbone.state_dict(), "main_idx": main_idx, "center_idx": center_idx,
-                    "aux_idx": aux_idx, "cfg": vars(a)}, a.out)
+                    "aux_idx": aux_idx, "cfg": vars(a), "epoch": ep + 1,
+                    "main_head": net.main_head.state_dict(), "center_head": net.center_head.state_dict(),
+                    "aux_head": net.aux_head.state_dict(),
+                    "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "scaler": scaler.state_dict() if amp else None}, a.out)
+    # final save: drop the optimizer/scaler state (~170MB of AdamW moments) so the encoder shipped to Stage-2
+    # and cached on Drive stays lean. Stage-2 only reads ["backbone"] and ["cfg"].
+    torch.save({"backbone": net.backbone.state_dict(), "main_idx": main_idx, "center_idx": center_idx,
+                "aux_idx": aux_idx, "cfg": vars(a), "epoch": a.epochs,
+                "main_head": net.main_head.state_dict(), "center_head": net.center_head.state_dict(),
+                "aux_head": net.aux_head.state_dict()}, a.out)
     print(f"saved concept-pretrained encoder -> {a.out}")
 
 
