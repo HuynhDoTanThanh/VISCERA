@@ -515,3 +515,70 @@ unresolvable paths it fails with the exact diagnosis instead of training on blan
 The AttnPool optimizer bug (§10.2, proven by execution), the rank-only metric (§10.1, algebraic), the
 Stage-1/Stage-2 resolution split (§10.3), the `--img`-under-spawn bug, and the pool-signal findings (§10.5) all
 survive. Gate cell 10 additionally never passed `--loco-no-semi` at all and ran `@448`; both fixed.
+
+---
+
+## 13. exp6 RESULTS + review (2026-08-19)
+
+### 13.1 Stage-1 is HEALTHY — and the new guards proved themselves in production
+`preflight OK` on **291,187/291,187** frames: cell 6 detected the Drive-cached matrix as unusable and rebuilt it,
+so the blank-image corruption of §12.3 **did not happen**. `concept encoder img=336 | ship img=336` — the
+resolution split of §10.3 is closed. Training was well-behaved:
+
+| | ep1 | ep30 |
+|---|---|---|
+| `main` (concept distillation) | 0.4939 | **0.3815** — monotone, still learning |
+| `center_grl` | 0.6516 | **0.6966** |
+
+`center_grl` ending at 0.6966 ≈ **ln 2 = 0.693 = chance**: the center head can no longer predict
+`black_border`/`overlay_graphics` above random. The GRL did what it was designed to do.
+
+### 13.2 The notebook's val numbers are INVALID — discard them
+Cell 12 (full-power, trained on train+**val**) **overwrote `ship_seed*.pt`**, and cell 16 then scored **val** with
+those weights → `PPV=AUROC=AUPRC=1.000` for POOLED/center_1/center_2, and cell 20's "ViT-anchor PPV@90R=1.000".
+That is memorization, exactly what the cell-12 banner warned about. Same for the D2F+ ensemble comparison.
+
+### 13.3 exp6, re-scored properly (weights that never saw val)
+`exp6/ship_seed{0,1,2}.pt` are the **train-only** models (`train_csv=train_colab.csv`, `semi_mode=mse`,
+`swad=False`). Re-scored on the 619 held-out val frames, 3-seed + 5-view TTA (= the container):
+
+| split | n | pos | PPV@90R | 95% CI | AUROC | AUPRC | FPR@90R |
+|---|---:|---:|---:|---|---:|---:|---:|
+| POOLED | 619 | 31 | 0.700 | [0.418, 1.000] | **0.971** | 0.955 | 0.0034 |
+| center_1 | 456 | 12 | 1.000 | [0.688, 1.000] | 1.000 | 0.994 | 0.0000 |
+| center_2 | 163 | 19 | 0.333 | [0.016, 1.000] | **0.967** | 0.944 | 0.0208 |
+
+Consistent with the prior same-center val regime (§4 reported AUROC 0.976 on center_2), so **no anomaly — but no
+evidence either**: same-center val sits near ceiling for every recipe here (LB AUROC has been 0.80–0.85 while val
+reads 0.97), so it cannot rank exp6 against exps/2. The LB is the measurement.
+
+### 13.4 exp6 is a TWO-variable change, not one
+Diffing the shipped cfgs against exps/2 (LB 0.0177): `aug: mild→domain` **and** `semi_use_decision: →True`. The
+second is a bug fix (ABSTAIN frames with a defaulted `suspicion=0.0` were being hard-taught as negatives) but it
+is still a second variable. Everything else matches exps/2's effective behaviour (`cg_head=False`,
+`mixstyle=False`, `pauc_q=0.2`, `semi_mode=mse`, `img=336`). **Both gates were skipped** (`RUN_GATE=False`,
+`RUN_AUG_GATE=False`), so exp6 ships on rationale — its LB score *is* the experiment.
+
+### 13.5 Corrections to §10 (this run contradicts two of my own claims)
+1. **"The semi loss self-extinguishes / is negligible" — WRONG for `mse`.** Printed `semi` = `semi_steps ×
+   semi_w × raw`, so at ep12 raw = 0.1200/(10×0.5) = **0.024 vs a supervised loss of 0.0046** — the pool term is
+   ~5× the labeled term, not vanishing.
+2. **"fixmatch fixes the vanishing gradient" — NOT SUPPORTED.** In the full-power run fixmatch ended at
+   `semi=0.0017` (raw 0.00034) vs mse's 0.1200 (raw 0.024) — **~70× smaller**. Once the teacher is confidently
+   negative on a 99%-negative pool, the masked CE collapses. Treat `--semi-mode fixmatch` as **unvalidated**;
+   the full-power model uses it, which is a risk, not a known improvement.
+3. Confirmed instead: the real pathology is **saturation** — supervised loss reaches 0.0126 by ep7 and 0.0046 by
+   ep12 on 127 positives in ~26 steps/epoch. More positives and more hard negatives (the full-power levers)
+   address this; changing the consistency form does not.
+
+### 13.6 Two local-scoring bugs found while re-scoring (container was never affected)
+* `phase3/infer.py` defaulted a checkpoint with no `img` key to **448**, while the container defaults to **336**.
+  exps/1 and exps/2 have no `img` key and were trained @336 — so any local re-score of the *winning* run was
+  served at the wrong resolution. Aligned to 336.
+* Scores were written at `%.6f`; these compress near 0 and produced **81 ties in 619 rows**, which depresses a
+  rank metric. The container writes full-precision floats, so local val was *pessimistic* vs what ships. Now
+  `repr(float(s))` → 618/619 unique.
+
+### 13.7 CNN member: still a no
+LOCO AUROC **0.861 (c2) / 0.952 (c1)** — worse than the ConvNeXt-Tiny of §H (0.932/0.976), and §7 already killed
+the ensemble on the honest bench. Do not ship it.

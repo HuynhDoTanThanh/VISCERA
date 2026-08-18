@@ -45,7 +45,10 @@ def _score_finetuned(pt_paths, paths, bs=32, tta="hflip"):
         # match BOTH the resize (FrameDS) and the ViT pos_embed (Net img_size) to how THIS ckpt was trained.
         # Net/FrameDS read the module-level ft.IMG (default 448 = the ship); a LOCO @336 ckpt needs it set to 336
         # or pos_embed mismatches (1024 vs 576). Build the dataset AFTER setting IMG; supports mixed-img ensembles.
-        ft.IMG = int(cfg.get("img", ft.IMG))
+        # Default 336, NOT ft.IMG (=448 from featurize). Checkpoints from before --img existed (exps/1, exps/2)
+        # carry no 'img' key but were trained @336; falling back to 448 silently serves them at the wrong
+        # resolution and understates them. This now matches the container (viscera_model.py:88).
+        ft.IMG = int(cfg.get("img", 336))
         net = Net(cfg.get("unfreeze", 4), cg_head=cfg.get("cg_head", False), backbone=cfg.get("backbone", "dinov2")).to(dev)
         net.load_state_dict(ckpt["model"]); net.eval()
         ds = FrameDS(list(paths), [0] * len(paths), train=False, img=ft.IMG)   # explicit: spawn-safe, matches this ckpt
@@ -98,7 +101,10 @@ def main():
     with open(a.out, "w", newline="") as f:
         w = csv.writer(f); w.writerow(["name", "score", "label"])
         for n, s, l in zip(names, scores, labels):
-            w.writerow([n, f"{s:.6f}", l])
+            # repr(), not 6 decimals: PPV@90R is a RANK metric and these scores compress near 0 (a real run
+            # produced 81 ties in 619 rows at %.6f). The container writes full-precision floats via json.dumps,
+            # so 6dp here made local val numbers PESSIMISTIC vs what actually ships.
+            w.writerow([n, repr(float(s)), l])
     print(f"wrote {len(scores)} predictions -> {a.out}")
 
 
