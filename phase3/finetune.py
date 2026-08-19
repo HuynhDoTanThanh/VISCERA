@@ -607,7 +607,7 @@ def main():
     semi_dl, ema = None, None
     if a.semi_manifest and os.path.exists(a.semi_manifest) and loco_drop_unl:
         print("HONEST-LOCO: semi pool DISABLED (--loco-no-semi) -> leak-free labeled-only cross-center compass")
-    elif a.semi_manifest and os.path.exists(a.semi_manifest) and a.holdout != "none":
+    elif a.semi_manifest and os.path.exists(a.semi_manifest) and a.holdout != "none" and a.fold < 0:
         print("⚠ LEAK WARNING: LOCO with the semi pool ON — unlabeled frames have no center label, so the held-out "
               "center may be in the pool (UDA to the test center) -> LOCO is OPTIMISTIC. Use --loco-no-semi for an "
               "honest compass, or trust phase3/loco_probe.py (frozen-LP, semi-free) which predicted the leaderboard.")
@@ -744,7 +744,8 @@ def main():
             # selection-on-noise (its MDE dwarfs the margins) and it biases the SWAD-vs-best comparison. AUPRC is
             # threshold-free and stable across epochs. PPV@90R stays a printed diagnostic. (nan-safe fallback to PPV.)
             sel = r["auprc"] if not np.isnan(r["auprc"]) else ppv
-            msg += (f"  LOCO-val({a.holdout}) PPV@90R={ppv:.4f} CI[{r['ci_lo']:.3f},{r['ci_hi']:.3f}]"
+            _tag = f"fold{a.fold}/{a.n_folds}" if a.fold >= 0 else a.holdout
+            msg += (f"  OOF-val({_tag}) PPV@90R={ppv:.4f} CI[{r['ci_lo']:.3f},{r['ci_hi']:.3f}]"
                     f" AUROC={r['auroc']:.3f} AUPRC={r['auprc']:.3f}")
             if sel > best:
                 best = sel
