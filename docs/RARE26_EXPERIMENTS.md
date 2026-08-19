@@ -695,3 +695,40 @@ acquisition source. Pseudo-domains must be discovered by clustering embeddings, 
 
 **This is the highest-ceiling and highest-variance lever in the pipeline. The reliable core remains ensembling
 (the winner used 40 models; we use 3).** Do not ship pseudo-positives ungated in the single closed-phase slot.
+
+---
+
+## 16. exp7 (MAX) — what changed vs the exp6 that scored 0.0195
+
+Backbone / resolution / aug / unfreeze / WiSE-FT are **unchanged** (dinov2 @336, `--aug domain`, last-6
+blocks, α=0.7). Everything that changed is about *how much data reaches the loss* and *how we measure*.
+
+| | exp6 (LB **0.0195**) | **exp7 (MAX)** |
+|---|---|---|
+| labeled csv | `train_colab.csv` | `trainval_colab.csv` |
+| labeled frames | 2,476 (**127 pos**) | 2,476/fold of 3,095 (**158 pos**, +24%) |
+| validation | none — `--holdout none` | **5-fold OOF on all 158 positives** |
+| unlabeled as y=0 | **NONE** | **214,584** CONFIDENT_NEGATIVE |
+| pseudo-positives | **NONE** | **600** @ soft 0.80 (A/B'd) |
+| semi pool | all 288k incl. conf-neg (redundant) | 74,125 ambiguous only |
+| semi bs × steps | 256 × 10 | 96 × 1 |
+| **steps/epoch** | **26** | **2,582** (99×) |
+| epochs | 12 | 3 |
+| **total optimizer steps** | **312** | **7,746** (25×) |
+| pos_per_batch | 8 | 12 |
+| pauc_q (tail) | 0.2 → optimises PPV@**80**R | **0.0625** → the real 90R point |
+| ohem_k | 0 | 12 |
+| ensemble | 3 seeds, 1 split | 5 folds (× seeds later) |
+| img / aug / backbone | 336 / domain / dinov2 | **same** |
+| unfreeze / wise_ft | 6 / 0.7 | **same** |
+
+**The three that should matter most, in order:**
+1. **216,934 supervised negatives vs 2,350.** `FPR@90R` *is* the fraction of negatives above the
+   threshold; exp6 learned "normal mucosa" from 2,350 examples and memorised by ep7 (loss 0.0046).
+2. **+31 real positives** (val folded in) — positives are the binding constraint on AUPRC, where we
+   trail the winner 0.390 vs 0.822.
+3. **5-fold OOF** — the first uncontaminated measurement in the project. Same-centre val is at ceiling
+   (0.97 vs 0.86 on the board) and LOCO is contaminated by the concept encoder.
+
+Build script renamed `build_exp6.sh` → **`build_submission.sh [SRC] [EXP]`** (defaults to `exp7`), now
+handling any ensemble size and excluding `*_ema.pt` from the member glob.
