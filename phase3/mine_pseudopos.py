@@ -17,9 +17,25 @@ about 23x the labeled positive count — concentrated exactly in the two buckets
 THE PU PROBLEM AND THE TRIPLE GATE
 ----------------------------------
 Naively promoting high-suspicion frames is dangerous: a pseudo-positive that is really NDBE teaches the
-model that NDBE looks neoplastic, which RAISES FPR@90R — the precise opposite of the goal. Raw VLM
-suspicion is far too weak on its own (its own PPV@90R baseline is ~0.04). So a frame is promoted only if
-THREE weakly-correlated signals agree:
+model that NDBE looks neoplastic, which RAISES FPR@90R — the precise opposite of the goal.
+
+BUT: measured against ground truth on the 3,095 labeled frames, VLM suspicion is a MUCH better
+high-precision detector than the docs assumed:
+
+    suspicion >= 0.5   n=139   precision 66.9%   recall 58.9%
+    suspicion >= 0.8   n= 70   precision 90.0%   recall 39.9%
+    suspicion >= 0.9   n= 32   precision 100.0%  recall 20.3%      (base rate 5.11%)
+
+Zero false positives among 2,937 labeled negatives at s>=0.9. The docs' "VLM baseline PPV@90R ~0.04"
+is a different operating point entirely — the VLM is a poor ranker at HIGH RECALL but an excellent
+detector at the TOP. We only need the top.
+
+THE ONE UNKNOWN: the pool has 5.88% of frames at s>=0.9 versus 1.03% in the labeled set (5.7x more,
+proportionally). Either the VLM over-flags raw video frames, or the pool is genuinely positive-rich —
+both fit the data, and they imply very different precision (<=17% if the pool is 1% positive, ~85% if
+it is 5%). So suspicion is used as a GATE, not as a label, the set is CAPPED, and the target is SOFT.
+
+A frame is promoted only if four weakly-correlated signals agree:
 
   A. CONCEPT gate  — trust-weighted score on the DECISIVE architectural/vascular hallmarks
      (demarcation, nodularity, vascular_irregularity, ...) at or above the labeled-positive percentile.
@@ -28,6 +44,7 @@ THREE weakly-correlated signals agree:
      the one you will train (`--score-with`), otherwise self-training just amplifies existing bias.
   C. BUCKET gate   — candidates come only from HARD_NEG_CANDIDATE / ABSTAIN. CONFIDENT_NEGATIVE is where
      the VLM was sure it is normal mucosa; promoting from there is almost pure noise.
+  D. SUSPICION gate — VLM overall suspicion >= --susp-min (default 0.9), the strongest single signal above.
 
 Output is a capped, ranked path list. Train with `finetune.py --pos-list ... --pos-soft 0.85`, which adds
 them as SOFT positives and — critically — excludes them from the soft-pAUC threshold quantile so a wrong
@@ -75,6 +92,13 @@ def main():
                     help="VLM decision buckets to mine. Deliberately EXCLUDES CONFIDENT_NEGATIVE.")
     ap.add_argument("--model-min", type=float, default=0.5,
                     help="model gate: minimum detector probability")
+    ap.add_argument("--susp-min", type=float, default=0.9,
+                    help="gate D — VLM suspicion. MEASURED against ground truth on the 3,095 labeled frames: "
+                         "s>=0.8 -> 90.0%% precision (n=70), s>=0.9 -> 100%% precision (n=32, ZERO false positives "
+                         "among 2,937 negatives) vs a 5.11%% base rate. This is the single strongest gate. "
+                         "CAVEAT: the pool has 5.88%% of frames at s>=0.9 vs 1.03%% in the labeled set (5.7x), so "
+                         "that precision does NOT transfer directly — either the VLM over-flags raw video frames, or "
+                         "the pool is genuinely positive-rich. Hence the cap and the soft target.")
     ap.add_argument("--topn", type=int, default=300,
                     help="cap. Keep this well under the labeled positive count (127) unless the LOCO gate says "
                          "otherwise — pseudo-positives are the highest-variance lever in the pipeline.")
@@ -100,13 +124,17 @@ def main():
     print(f"gate A (concept >= p{a.pos_pct:g} of labeled positives = {thr:.4f}): "
           f"{int(gate_a.sum()):,} / {int(unl.sum()):,} unlabeled")
 
-    # ---- gate C: VLM decision bucket ----------------------------------------------------------------
+    # ---- gates C (bucket) + D (VLM suspicion) -------------------------------------------------------
     want = {b.strip() for b in a.buckets.split(",")}
     m = np.load(a.manifest, allow_pickle=True)
-    dec_by_path = dict(zip(m["img_path"].astype(str), m["decision"].astype(str)))
+    mp = m["img_path"].astype(str)
+    dec_by_path = dict(zip(mp, m["decision"].astype(str)))
+    susp_by_path = dict(zip(mp, m["suspicion"].astype(float)))
     in_bucket = np.array([dec_by_path.get(p, "?") in want for p in paths])
-    gate_ac = gate_a & in_bucket
-    print(f"gate C (decision in {sorted(want)}): {int(gate_ac.sum()):,} survive A+C")
+    hi_susp = np.array([susp_by_path.get(p, 0.0) >= a.susp_min for p in paths])
+    gate_ac = gate_a & in_bucket & hi_susp
+    print(f"gate C (decision in {sorted(want)}): {int((gate_a & in_bucket).sum()):,} survive A+C")
+    print(f"gate D (VLM suspicion >= {a.susp_min}): {int(gate_ac.sum()):,} survive A+C+D")
     if gate_ac.sum() == 0:
         raise SystemExit("no candidates survived the concept+bucket gates — loosen --pos-pct")
 
