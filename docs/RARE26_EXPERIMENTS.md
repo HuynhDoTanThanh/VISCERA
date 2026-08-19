@@ -633,3 +633,65 @@ scale/diversity is the single largest structural difference, and it is precisely
 
 **Do NOT spend submissions on:** any @448 variant (5-experiment signal), global score recalibration (§10.1 proves
 it is an exact no-op), or the ImageNet-ConvNeXt CNN member (§7, and its LOCO got worse in this run).
+
+---
+
+## 15. THE POSITIVE-SIDE LEVER (2026-08-19) — the one thing the pipeline has never done
+
+### 15.1 The argument
+exp6: AUROC 0.860 (winner 0.920, **1.07×**) but AUPRC 0.390 (winner 0.822, **2.11×**). AUPRC is dominated by how
+the *hard positives* rank. Every use of the 288,711-frame pool to date is on the **negative / regularisation**
+side — Mean-Teacher consistency, one-sided-PU negatives, hard-FP mining, colour-consistency. **Nothing has ever
+added positive supervision.** We train on 127 positives.
+
+Measured pool composition (sampled from `out/`, n=4,000 → extrapolated):
+
+| bucket | frames |
+|---|---:|
+| CONFIDENT_NEGATIVE | 214,584 |
+| **HARD_NEG_CANDIDATE** | **61,567** |
+| **ABSTAIN** | **12,558** |
+| VLM suspicion > 0.9 | 16,961 |
+
+At ~1% true prevalence the pool holds on the order of **~2,900 unlabeled true positives ≈ 23× the labeled count**,
+concentrated in exactly the two buckets the pipeline quarantines.
+
+### 15.2 Why naive promotion fails, and the triple gate
+A pseudo-positive that is really NDBE teaches "NDBE looks neoplastic" and **raises** FPR@90R — the exact opposite
+of the goal. Raw VLM suspicion is far too weak alone (its own PPV@90R baseline is ~0.04). `mine_pseudopos.py`
+promotes a frame only when three weakly-correlated signals agree:
+
+| gate | signal |
+|---|---|
+| **A concept** | trust-weighted DECISIVE-hallmark score ≥ the labeled-positive percentile — the exact *inverse* of the PU guard `mine_hardneg.py` already uses to *exclude* likely positives |
+| **B model** | detector probability ≥ threshold, scored by models from a **different fold** (else self-training amplifies its own bias) |
+| **C bucket** | HARD_NEG_CANDIDATE / ABSTAIN only — never CONFIDENT_NEGATIVE |
+
+Training support (`finetune.py --pos-list --pos-soft 0.85 --pos-cap`): they enter BCE and the pairwise-rank loss
+as soft positives, are counted as positives by the balanced sampler, and are **excluded from the soft-pAUC
+threshold quantile** (`y >= 0.999`) so an unverified label can never define the operating point. They are dropped
+under `--loco-no-semi` like every other unlabeled pool.
+
+### 15.3 CORRECTION — the hard-negative mine contradicted our own design rule
+`mine_hardneg.py --pool` defaulted to `HARD_NEG_CANDIDATE,CONFIDENT_NEGATIVE`, and the full-power notebook cell
+used that default. But ARCHITECTURE.md §5 established: *"Quarantine HARD_NEG_CANDIDATE (never y=0) — that bucket
+is where the ~1% PU true-positives concentrate; pinning to 0 manufactures false negatives → craters recall (fatal
+at 90R)."* Mining hard negatives from that bucket **violates the rule** and would have shipped in the full-power
+run. Default corrected to **CONFIDENT_NEGATIVE only**; HARD_NEG_CANDIDATE is now the *input to the positive mine*
+instead. Clean split: confident-negatives feed the negative mine, hard-negative-candidates feed the positive mine.
+
+### 15.4 Also corrected: `dir` is NOT a domain label
+§10.5 suggested center could be recovered from the manifest's `dir` field. **Wrong** — verified: each dir is a
+contiguous, non-overlapping 10,000-ID block (density 1.00), i.e. an arbitrary shard of the export, not an
+acquisition source. Pseudo-domains must be discovered by clustering embeddings, not read from metadata.
+
+### 15.5 Honest risk register
+| risk | severity | mitigation |
+|---|---|---|
+| PU contamination raises FPR@90R | **high** | soft target 0.85, `--pos-cap`, excluded from the pAUC quantile, triple gate |
+| self-training amplifies existing bias | medium | score with a **different fold's** models |
+| the three gates are correlated (all appearance-derived) | medium | keep `--topn` small (≤300 ≈ +2× positives), gate on LOCO |
+| we cannot validate cheaply (LOCO needs a `--holdout labeled` encoder) | **high** | each LB submission also returns a *Validation RARE25* row — two measurements per submission |
+
+**This is the highest-ceiling and highest-variance lever in the pipeline. The reliable core remains ensembling
+(the winner used 40 models; we use 3).** Do not ship pseudo-positives ungated in the single closed-phase slot.

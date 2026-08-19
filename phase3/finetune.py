@@ -302,7 +302,7 @@ class PosBalancedBatchSampler(torch.utils.data.Sampler):
     positive and the operating-point losses are silent no-ops (audit finding)."""
     def __init__(self, labels, batch_size, pos_per_batch=8, seed=0):
         self.labels = np.asarray(labels); self.bs = batch_size
-        self.pos = np.where(self.labels == 1)[0]; self.neg = np.where(self.labels == 0)[0]
+        self.pos = np.where(self.labels > 0)[0]; self.neg = np.where(self.labels == 0)[0]   # y>0 = real + pseudo
         self.ppb = min(pos_per_batch, max(1, len(self.pos))); self.npb = max(1, batch_size - self.ppb)
         self.nbatches = max(1, len(self.neg) // self.npb); self.epoch = 0; self.seed = seed
 
@@ -327,7 +327,7 @@ def pairwise_rank_loss(logits, y, margin=1.0, ohem_k=0):
     negatives = the pairs that actually sit at the 90R threshold). A uniform mean over all P*N pairs spends
     most of its gradient on already-separated easy pairs; top-k concentrates the margin exactly where
     PPV@90R is decided. No new params, no graph change."""
-    pos, neg = logits[y == 1], logits[y == 0]
+    pos, neg = logits[y > 0], logits[y == 0]        # y>0 includes SOFT pseudo-positives (--pos-soft)
     if len(pos) == 0 or len(neg) == 0:
         return logits.sum() * 0.0
     diff = pos.unsqueeze(1) - neg.unsqueeze(0)          # (P, N)
@@ -339,9 +339,13 @@ def pairwise_rank_loss(logits, y, margin=1.0, ohem_k=0):
 
 def soft_pauc90(logits, y, q=0.2):
     """Soft partial-AUC at the 90R operating point: penalize negatives scoring above the low-percentile
-    positive (the threshold where recall~90%). q=0.2 (not 0.1) since only ~8 positives/batch. Targets the
-    FP tail PPV@90R sees. (quantile needs float32 — AMP gives half.)"""
-    pos, neg = logits[y == 1].float(), logits[y == 0].float()
+    positive (the threshold where recall~90%). Targets the FP tail PPV@90R sees.
+    (quantile needs float32 — AMP gives half.)
+
+    The quantile is taken over REAL positives only (y>=0.999). Soft pseudo-positives (--pos-soft) are
+    unverified: if one is actually NDBE and sets this threshold, the loss would defend a wrong operating
+    point. They still participate in the rank loss and BCE, just never define the threshold."""
+    pos, neg = logits[y >= 0.999].float(), logits[y == 0].float()
     if len(pos) < 2 or len(neg) == 0:
         return logits.sum() * 0.0
     thr = torch.quantile(pos, q)
@@ -379,7 +383,7 @@ def layerwise_param_groups(net, base_lr, decay=0.75, head_lr_mult=10.0):
 
 def load_split(csv_path, neg_list="", neg_cap=0):
     rows = list(csv.DictReader(open(csv_path)))
-    paths = [r["path"] for r in rows]; labels = [int(r["label"]) for r in rows]; centers = [r["center"] for r in rows]
+    paths = [r["path"] for r in rows]; labels = [float(r["label"]) for r in rows]; centers = [r["center"] for r in rows]
     extra_neg = []
     if neg_list:
         # FAIL LOUD: a mistyped/absent --neg-list used to silently run fully-supervised, so an "experiment with the
@@ -409,6 +413,14 @@ def main():
     ap.add_argument("--train-csv", default="dataset/train.csv")
     ap.add_argument("--holdout", default="center_2", help="center to hold out for LOCO val; 'none' = train on all (ship)")
     ap.add_argument("--neg-list", default=""); ap.add_argument("--neg-cap", type=int, default=6000)
+    ap.add_argument("--pos-list", default="",
+                    help="phase3/mine_pseudopos.py output: unlabeled frames promoted to PSEUDO-POSITIVES. The only "
+                         "lever that adds positive supervision beyond the 127 labeled ones — and the highest-variance "
+                         "one, since a wrong pseudo-positive teaches 'NDBE looks neoplastic' and RAISES FPR@90R. "
+                         "Added at --pos-soft, and EXCLUDED from the soft-pAUC threshold quantile.")
+    ap.add_argument("--pos-soft", type=float, default=0.85,
+                    help="soft BCE target for --pos-list frames (<1.0 = the label is unverified)")
+    ap.add_argument("--pos-cap", type=int, default=0, help="cap on --pos-list frames (0 = all)")
     ap.add_argument("--unfreeze", type=int, default=4)
     ap.add_argument("--head-only", action="store_true",
                     help="freeze the ENTIRE encoder; train only the linear head (LP readout of the concept "
@@ -529,13 +541,27 @@ def main():
         print(f"+ {len(extra_neg)} unlabeled negatives")
     elif extra_neg and loco_drop_unl:
         print(f"HONEST-LOCO: dropped {len(extra_neg)} unlabeled negatives (--loco-no-semi, anti-leak)")
+    # PSEUDO-POSITIVES: soft-labeled unlabeled frames (mine_pseudopos.py). Dropped under --loco-no-semi for the
+    # same reason the other unlabeled pools are: they carry no center label and would leak the held-out center.
+    if a.pos_list:
+        if not os.path.exists(a.pos_list):
+            raise FileNotFoundError(f"--pos-list {a.pos_list} does not exist (refusing to silently drop it)")
+        pp = [ln.strip() for ln in open(a.pos_list) if ln.strip()]
+        if a.pos_cap:
+            pp = pp[:a.pos_cap]
+        if loco_drop_unl:
+            print(f"HONEST-LOCO: dropped {len(pp)} pseudo-positives (--loco-no-semi, anti-leak)")
+        else:
+            tp += pp; tl += [float(a.pos_soft)] * len(pp)
+            print(f"+ {len(pp)} PSEUDO-positives @ soft target {a.pos_soft} "
+                  f"(real positives: {int(sum(1 for v in tl if v >= 0.999))}) — UNVERIFIED, gate before shipping")
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     net = Net(a.unfreeze, init_ckpt=a.init or None, head_only=a.head_only, cg_head=a.cg_head, backbone=a.backbone,
               mixstyle=a.mixstyle, mixstyle_p=a.mixstyle_p, mixstyle_alpha=a.mixstyle_alpha).to(dev)
     init_bb = {k: v.detach().cpu().clone() for k, v in net.backbone.state_dict().items()}  # for WiSE-FT
     ntrain = sum(p.numel() for p in net.parameters() if p.requires_grad)
     mode = "HEAD-ONLY (frozen encoder linear probe)" if a.head_only else f"unfreeze last {a.unfreeze} blocks"
-    print(f"train frames={len(tp)} pos={int(np.sum(tl))} | {mode} | trainable params={ntrain/1e6:.3f}M | holdout={a.holdout}")
+    print(f"train frames={len(tp)} pos={int(sum(1 for v in tl if v > 0))}(real {int(sum(1 for v in tl if v >= 0.999))}) | {mode} | trainable params={ntrain/1e6:.3f}M | holdout={a.holdout}")
 
     ds = FrameDS(tp, tl, train=True, aug=a.aug, aug_config=a.aug_config, img=IMG)
     sampler = PosBalancedBatchSampler(tl, a.bs, pos_per_batch=a.pos_per_batch, seed=a.seed)

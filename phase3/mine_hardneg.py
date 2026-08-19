@@ -54,8 +54,14 @@ def main():
     ap.add_argument("--score-with", default="",
                     help="comma-sep fine-tuned .pt to score the pool with; emits unl_modelFP.txt (model's top FPs "
                          "among VLM-negative frames = the hard negatives that decide PPV@90R). Skips the static writes.")
-    ap.add_argument("--pool", default="HARD_NEG_CANDIDATE,CONFIDENT_NEGATIVE",
+    ap.add_argument("--pool", default="CONFIDENT_NEGATIVE",
                     help="VLM decisions eligible to be mined as negatives (very-likely-negative buckets only)")
+                    # DEFAULT CHANGED 2026-08: was "HARD_NEG_CANDIDATE,CONFIDENT_NEGATIVE".
+                    # ARCHITECTURE.md section 5 established that HARD_NEG_CANDIDATE must never be pinned
+                    # to y=0 — it is where the unlabeled true positives concentrate (mean suspicion 0.80),
+                    # so labeling it negative MANUFACTURES FALSE NEGATIVES and craters recall, which is
+                    # fatal at 90R. Mine hard negatives from CONFIDENT_NEGATIVE only; HARD_NEG_CANDIDATE
+                    # is the input to mine_pseudopos.py (the POSITIVE mine) instead.
     ap.add_argument("--topn", type=int, default=3000, help="how many model-FP hard negatives to emit")
     ap.add_argument("--skip-top", type=int, default=200,
                     help="drop the top-scoring candidates (PU guard: the very top may be real positives, not FPs)")
