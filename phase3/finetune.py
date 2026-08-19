@@ -412,6 +412,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-csv", default="dataset/train.csv")
     ap.add_argument("--holdout", default="center_2", help="center to hold out for LOCO val; 'none' = train on all (ship)")
+    ap.add_argument("--fold", type=int, default=-1,
+                    help="stratified k-fold instead of --holdout: hold out fold K (0-indexed) of --n-folds, "
+                         "stratified by (label, center). Gives ensemble diversity AND -- pooled across folds -- "
+                         "OUT-OF-FOLD predictions on every labeled positive, which is the only uncontaminated "
+                         "validation signal available (same-centre val is at ceiling; LOCO needs a leak-free "
+                         "concept encoder). -1 = off.")
+    ap.add_argument("--n-folds", type=int, default=5)
     ap.add_argument("--neg-list", default=""); ap.add_argument("--neg-cap", type=int, default=6000)
     ap.add_argument("--pos-list", default="",
                     help="phase3/mine_pseudopos.py output: unlabeled frames promoted to PSEUDO-POSITIVES. The only "
@@ -456,6 +463,12 @@ def main():
                          "center-filtered — leaving them in trains the model on the held-out center via consistency "
                          "(unsupervised domain adaptation TO the test center) and inflates LOCO. Set this for a "
                          "leak-free labeled-only cross-center compass. No effect on the ship (--holdout none).")
+    ap.add_argument("--semi-buckets", default="",
+                    help="restrict the semi pool to these VLM decision buckets, e.g. "
+                         "'HARD_NEG_CANDIDATE,ABSTAIN'. When the CONFIDENT_NEGATIVE frames are already being "
+                         "trained as LABELED negatives via --neg-list, running consistency over the same frames "
+                         "is redundant; the pool's real job is the AMBIGUOUS frames no label can cover. "
+                         "'' = the whole pool (previous behaviour).")
     ap.add_argument("--semi-rampup", type=int, default=5, help="epochs to ramp the semi weight 0->1 after --warmup")
     # ---- CG-AMIL head: gated attention-MIL pooling (lifts a few-patch lesion vs mean-pool) + entropy floor ----
     ap.add_argument("--backbone", choices=["dinov2", "dinov3"], default="dinov3",
@@ -527,7 +540,18 @@ def main():
               "a bare invocation ships the least-robust model.", flush=True)
 
     paths, labels, centers, extra_neg = load_split(a.train_csv, a.neg_list, a.neg_cap)
-    if a.holdout != "none":
+    if a.fold >= 0:
+        # deterministic stratified assignment: order within each (label, center) stratum, round-robin the folds
+        key = np.array([f"{int(l)}_{c}" for l, c in zip(labels, centers)])
+        fold_id = np.empty(len(labels), int)
+        for k in np.unique(key):
+            idx = np.where(key == k)[0]
+            idx = idx[np.argsort(paths[idx])]              # stable, independent of csv row order
+            fold_id[idx] = np.arange(len(idx)) % a.n_folds
+        trm = fold_id != a.fold; vam = fold_id == a.fold
+        print(f"FOLD {a.fold}/{a.n_folds}: train {int(trm.sum())} ({int(labels[trm].sum())} pos) | "
+              f"held-out {int(vam.sum())} ({int(labels[vam].sum())} pos)")
+    elif a.holdout != "none":
         trm = centers != a.holdout; vam = centers == a.holdout
     else:
         trm = np.ones(len(paths), bool); vam = np.zeros(len(paths), bool)
@@ -535,7 +559,7 @@ def main():
     # LEAK GUARD: the unlabeled pools (neg-list + semi) have NO center label and cannot be filtered to exclude the
     # held-out center. Under --holdout they otherwise leak that center into training (UDA to the test center ->
     # optimistic LOCO). --loco-no-semi drops both pools for an honest labeled-only cross-center compass.
-    loco_drop_unl = (a.holdout != "none") and a.loco_no_semi
+    loco_drop_unl = (a.holdout != "none" or a.fold >= 0) and a.loco_no_semi
     if extra_neg and not loco_drop_unl:
         tp += extra_neg; tl += [0] * len(extra_neg)
         print(f"+ {len(extra_neg)} unlabeled negatives")
@@ -594,6 +618,12 @@ def main():
         # decision is the VLM's own bucket (CONFIDENT_NEGATIVE / HARD_NEG_CANDIDATE / ABSTAIN). It is far more
         # reliable than thresholding a suspicion score that mine_hardneg defaults to 0.0 when the VLM refused.
         udec = z["decision"] if "decision" in z.files else np.array(["?"] * len(up))
+        if a.semi_buckets:
+            want_b = {b.strip() for b in a.semi_buckets.split(",")}
+            bm = np.array([d in want_b for d in udec])
+            print(f"semi restricted to {sorted(want_b)}: {int(bm.sum()):,} / {len(up):,} frames "
+                  f"(the rest are covered by --neg-list as hard labels)")
+            up, us, udec = up[bm], us[bm], udec[bm]
         ridx = np.random.default_rng(a.seed).choice(len(up), min(a.semi_n * 2, len(up)), replace=False)
         up2, us2, ud2 = up[ridx], us[ridx], udec[ridx]
         keep = np.array([os.path.exists(p) for p in up2])          # check only the sample, not all 145k
