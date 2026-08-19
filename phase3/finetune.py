@@ -753,6 +753,12 @@ def main():
                 # Frame order is identical across runs (same csv + holdout + sequential loader) -> sA,sB align.
                 np.savez(a.out[:-3] + "_loco.npz", y=np.array(labels[vam]), c=np.array(centers[vam]), s=s)
                 msg += "  *saved*"
+            # UNBIASED OOF: the block above saves the BEST-AUPRC epoch, selected on this very held-out fold,
+            # so its scores are a max-over-epochs on their own eval set = optimistic. Also persist the
+            # FINAL-epoch scores, which involve no selection at all. Report both; the final-epoch pooled OOF
+            # is the honest estimate, the best-epoch one is for like-for-like arm comparisons.
+            if ep == a.epochs - 1:
+                np.savez(a.out[:-3] + "_loco_final.npz", y=np.array(labels[vam]), c=np.array(centers[vam]), s=s)
         print(msg, flush=True)
         if a.swad and ep >= a.epochs - a.swad_last_n:   # accumulate the flat tail of the trajectory
             sd = net.state_dict()
