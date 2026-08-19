@@ -582,3 +582,54 @@ is still a second variable. Everything else matches exps/2's effective behaviour
 ### 13.7 CNN member: still a no
 LOCO AUROC **0.861 (c2) / 0.952 (c1)** — worse than the ConvNeXt-Tiny of §H (0.932/0.976), and §7 already killed
 the ensemble on the honest bench. Do not ship it.
+
+---
+
+## 14. exp6 LEADERBOARD RESULT (2026-08-19) — the first improvement in four submissions
+
+| run | img | aug | PPV@90R | AUROC | AUPRC | implied FPR@90R |
+|---|---|---|---:|---:|---:|---:|
+| exp1 | 336 | mild | 0.0181 | 0.845 | 0.356 | 0.488 |
+| exps/2 | 336 | mild+semi | 0.0177 | 0.854 | 0.401 | 0.499 |
+| exps/3 | 448 | dinov3 | 0.0117 | 0.756 | 0.300 | 0.760 |
+| exps/4 | 448 | bundle | 0.0155 | 0.829 | 0.355 | 0.572 |
+| exps/5 | 448 | simple | 0.0128 | 0.797 | 0.351 | 0.694 |
+| **exp6** | **336** | **domain** | **0.0195** | **0.8602** | 0.3900 | **0.453** |
+| open-dev top-1 | | | 0.0271 | | | 0.323 |
+| RARE25 winner (IMSY) | | | 0.0350 | 0.920 | **0.822** | 0.248 |
+
+exp6 also reports **Validation RARE25: PPV 0.0163 / AUROC 0.9086 / AUPRC 0.6154**.
+
+**Read:** exp6 is the best submission on PPV **and** AUROC **and** it beats exps/2 on the implied FPR. `--aug domain`
+at @336 is the first lever to move the board after exps/3-5 all regressed. Honest caveat: ΔAUROC vs exps/2 is
++0.006 — **below the ±0.03 noise floor** — and the PPV CI is [0.0092, 0.1061]. Statistically this is a tie; the
+evidence is that it is best on *all three* metrics at once and did not regress. Treat it as "aug-domain is safe and
+probably mildly positive", not as a proven +0.002.
+
+### 14.1 THE DIAGNOSTIC — the gap is AUPRC, not AUROC
+| | exp6 | winner | ratio |
+|---|---:|---:|---|
+| AUROC | 0.860 | 0.920 | 1.07× |
+| **AUPRC** | **0.390** | **0.822** | **2.11×** |
+
+AUROC is within 7% of the winner while AUPRC is **less than half**. AUPRC is dominated by how well positives are
+ranked in the high-precision region — exactly where PPV@90R is read. So the deficit is **not** general ranking and
+**not** calibration (which is a proven no-op, §10.1); it is that our hardest positives sit too low relative to the
+negative bulk. To hit 0.0271 we must cut FPs above the threshold by **29%**; to hit 0.035, by **45%**.
+
+### 14.2 What the winner did that we have not
+IMSY: **40 models** (20 GastroNet-ResNet50 + 20 LoRA DINOv3 ViT-L) from **5-fold CV**, at only 224px, with
+per-member affine recalibration before fusion. We ship **3 seeds of one architecture on one split**. Ensemble
+scale/diversity is the single largest structural difference, and it is precisely the lever that raises AUPRC.
+
+### 14.3 Ranked plan for the remaining days
+| # | lever | why it should move AUPRC/FPR | cost |
+|---|---|---|---|
+| 1 | **Submit the already-trained full-power model** (`RARE_LG/final/`) — train+val (**158 pos, +24%**) + 3k mined hard-FP negatives + deep tail loss + SWAD + EMA | more positives = better tail ranking; mined FPs delete mass exactly above τ₉₀ᴿ; also ~3× more optimizer steps/epoch (fixes the ep7 saturation) | already trained — build + upload |
+| 2 | **Scale the ensemble 3 → 15-20** (5-fold CV × 3 seeds, all @336 aug-domain) | the winner's core method and the most reliable AUPRC lever; variance reduction on the positive tail | ~15-20 GPU-hours on the 96GB Blackwell |
+| 3 | **GastroNet ResNet-50 family** (public: `huggingface.co/tgwboers/GastroNet-5M_Pretrained_Weights`) | the winner's other half; genuine architectural decorrelation — unlike our ImageNet-ConvNeXt member, this one is in-domain pretrained | medium |
+| 4 | **`--pauc-q 0.0625 --pos-per-batch 16 --ohem-k 16`** | we currently defend the 20th-pct positive = we optimise PPV@80R; the metric reads the 10th | tiny (untested) |
+| 5 | **Per-member ECDF normalisation before prob-fusion** | the only legitimate reading of IMSY's "affine recalibration" — non-monotone overall, hence real | small |
+
+**Do NOT spend submissions on:** any @448 variant (5-experiment signal), global score recalibration (§10.1 proves
+it is an exact no-op), or the ImageNet-ConvNeXt CNN member (§7, and its LOCO got worse in this run).
