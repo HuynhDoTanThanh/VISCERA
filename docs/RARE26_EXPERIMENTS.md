@@ -732,3 +732,54 @@ blocks, α=0.7). Everything that changed is about *how much data reaches the los
 
 Build script renamed `build_exp6.sh` → **`build_submission.sh [SRC] [EXP]`** (defaults to `exp7`), now
 handling any ensemble size and excluding `*_ema.pt` from the member glob.
+
+---
+
+## 17. exp8 — 100% of the corpus, no semi, no k-fold
+
+Time pressure removed the 5-fold sweep, so exp8 is a single 3-seed ship. Every one of the 288,711
+unlabeled frames is still in the loss, each at the reliability the VLM actually provides for it:
+
+| frames | role | source of the label |
+|---:|---|---|
+| 214,584 | **hard y = 0** | VLM `decision == CONFIDENT_NEGATIVE` |
+| **73,525** | **35-concept distillation** (`--concept-aux`) | VLM's full concept vector |
+| 600 | soft y = 0.80 | 4-gate mine (concept ∩ bucket ∩ suspicion≥0.95 ∩ model≥0.90) |
+| 3,095 | y ∈ {0,1} | ground truth (158 positives) |
+| **288,709** | **100%** | |
+
+### 17.1 Concept distillation replaces the semi loss — measured, not assumed
+The ambiguous frames cannot take a binary label (the VLM abstained; §5 forbids pinning them to 0).
+But the VLM emitted **all 35 concepts for every one of them**, and that is a dense supervised signal
+we were discarding.
+
+| | loss value | cost per step |
+|---|---:|---|
+| semi consistency (exp7 fold-0, measured) | **0.003** | 2 forwards (student + EMA teacher) |
+| concept distillation (measured) | **0.217** | 1 forward |
+
+**~70× the gradient at half the compute.** It also fixes a defect flagged early and never addressed:
+`finetune.py` has **no concept term at all**, so 9 epochs of binary fine-tuning drift the encoder off
+the Stage-1 clinical axes with only WiSE-FT pulling back. `demarcation`/`nodularity` are
+center-invariant by construction, so holding the encoder to them during Stage-2 is a direct brake on
+drifting into the center-specific texture that inflates cross-centre FPR@90R.
+
+The auxiliary head is initialised from the Stage-1 `main_head` and distils only the **MAIN**
+(diagnostic) concepts — never the center-cue ones, which Stage-1 deliberately pushes out via GRL.
+
+### 17.2 Verified before shipping
+* concept head **is in the optimizer** and demonstrably updates (42.5733M covered == 42.5733M
+  trainable) — the `AttnPool` bug class does not repeat.
+* the container **tolerates the 4 new `concept_head.*` keys**: `viscera_model` loads with
+  `strict=False` and asserts only on missing keys, so a 183-tensor exp8 checkpoint loads and scores
+  (verified on a synthetic exp8 checkpoint through `VisceraEnsemble`).
+* ship mode (`--holdout none`) runs with concept-aux + pseudo-positives + SWAD + EMA together.
+
+### 17.3 Budget and the honest caveat
+2,589 steps/epoch × 9 epochs ≈ **3.2 h/seed**, **9.7 GPU-hours** for 3 seeds.
+
+**exp8 has no internal validation.** val is now training data and there are no folds, so the
+leaderboard is the only measurement. Every change vs exp6 is therefore mechanism-driven rather than
+tuned: 216k negatives because FPR@90R *is* the negative-side rate; +31 real positives because
+positives bind AUPRC; concept-aux because Stage-2 was forgetting Stage-1. If time later allows, a
+single fold (~3 h) buys an OOF sanity check before the closed-phase submission.

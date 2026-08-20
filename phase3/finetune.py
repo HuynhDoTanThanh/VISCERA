@@ -147,6 +147,25 @@ class Net(nn.Module):
         self.cg_head = cg_head
         self.attn = AttnPool(768, 128) if cg_head else None   # ~0.2M params; only added key set vs mean-pool
         self.mixstyle = MixStyle(mixstyle_p, mixstyle_alpha) if mixstyle else None   # 0 params; train-only
+        self.concept_head = None            # built by attach_concept_head() when --concept-aux is used
+
+    def attach_concept_head(self, n_concepts, state=None):
+        """Auxiliary head predicting the VLM concepts from the SAME [cls (+) pooled] feature the binary head
+        reads, so the gradient reaches the trunk and holds it on the clinical axes. Initialised from the
+        Stage-1 main_head when the shapes match, otherwise fresh."""
+        self.concept_head = nn.Sequential(nn.LayerNorm(2 * 768), nn.Linear(2 * 768, n_concepts))
+        if state is not None:
+            try:
+                self.concept_head.load_state_dict(state); print(f"[concept-aux] head loaded from Stage-1 ({n_concepts} concepts)")
+            except Exception as e:
+                print(f"[concept-aux] fresh head ({n_concepts} concepts) — Stage-1 head not reusable: {e}")
+        return self.concept_head
+
+    def features(self, x):
+        f = self.backbone.forward_features(x)
+        p = f[:, 5:]
+        pooled = self.attn(p)[0] if self.cg_head else p.mean(1)
+        return torch.cat([f[:, 0], pooled], -1)
 
     def forward(self, x, return_attn=False):
         f = self.backbone.forward_features(x)            # (B, 1+4+N, 768)  N=576@336 / 1024@448
@@ -296,6 +315,38 @@ class UnlabeledDS(torch.utils.data.Dataset):
         return self._norm(self.weak(im)), self._norm(self.strong(im)), float(self.cneg[i])
 
 
+class ConceptAuxDS(torch.utils.data.Dataset):
+    """Ambiguous unlabeled frames + their 35-dim VLM concept targets, for the Stage-2 AUXILIARY head.
+
+    These frames (HARD_NEG_CANDIDATE / ABSTAIN) cannot get a binary label -- the VLM itself abstained, and
+    ARCHITECTURE.md section 5 forbids pinning them to y=0. But the VLM DID emit all 35 concepts for every one
+    of them, which is a dense, center-invariant supervised signal that is simply thrown away today.
+
+    Distilling those concepts during Stage-2 does two jobs at once:
+      * it puts the remaining ~73.5k frames into the loss (100% pool utilisation), and
+      * it stops Stage-2 from forgetting Stage-1. finetune.py has no concept term at all, so 9 epochs of
+        binary fine-tuning drift the encoder off its clinical axes and only WiSE-FT partially pulls it back.
+    Concepts like demarcation/nodularity are center-invariant by construction, so holding the encoder to them
+    while it learns the binary task is a direct brake on drifting into center-specific texture -- which is
+    what inflates cross-centre FPR@90R.
+    """
+    def __init__(self, paths, value, sup, aug="domain", img=None):
+        self.paths = list(paths); self.value = value; self.sup = sup
+        IMG = self.img = int(img) if img is not None else globals()["IMG"]
+        self.tf = T.Compose([T.RandomResizedCrop(IMG, scale=(0.7, 1.0), ratio=(0.85, 1.18)),
+                             T.RandomHorizontalFlip(), AcquisitionAug()]) if aug == "domain" else \
+                  T.Compose([T.RandomResizedCrop(IMG, scale=(0.7, 1.0)), T.RandomHorizontalFlip()])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        im = self.tf(Image.open(self.paths[i]).convert("RGB"))
+        x = (torch.from_numpy(np.asarray(im.resize((self.img, self.img)), np.float32).copy())
+             .permute(2, 0, 1) / 255. - _MEAN) / _STD
+        return x, torch.from_numpy(self.value[i].copy()), torch.from_numpy(self.sup[i].copy())
+
+
 class PosBalancedBatchSampler(torch.utils.data.Sampler):
     """Each batch carries exactly `pos_per_batch` positives (oversampled) + negatives, so the soft-pAUC /
     pairwise-rank tail losses ALWAYS fire. Without this, at ~1.5% positive rate a shuffled batch holds <1
@@ -372,6 +423,8 @@ def layerwise_param_groups(net, base_lr, decay=0.75, head_lr_mult=10.0):
     # whose grads were never applied nor zeroed. Every "CG-AMIL regressed" conclusion measured random attention.
     if getattr(net, "attn", None) is not None:
         groups.append({"params": list(net.attn.parameters()), "lr": base_lr * head_lr_mult})
+    if getattr(net, "concept_head", None) is not None:
+        groups.append({"params": list(net.concept_head.parameters()), "lr": base_lr * head_lr_mult})
     # fail loud if any trainable tensor is missing from the optimizer (this is how the bug above hid for 5 experiments)
     in_groups = sum(p.numel() for g in groups for p in g["params"])
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
@@ -463,6 +516,16 @@ def main():
                          "center-filtered — leaving them in trains the model on the held-out center via consistency "
                          "(unsupervised domain adaptation TO the test center) and inflates LOCO. Set this for a "
                          "leak-free labeled-only cross-center compass. No effect on the ship (--holdout none).")
+    ap.add_argument("--concept-aux", default="",
+                    help="concept_targets.npz -> distil the 35 VLM concepts on the AMBIGUOUS pool during "
+                         "Stage-2. Puts the ~73.5k HARD_NEG/ABSTAIN frames into the loss (they cannot take a "
+                         "binary label) AND stops Stage-2 forgetting Stage-1: finetune.py otherwise has no "
+                         "concept term, so 9 epochs of binary FT drift the encoder off its clinical axes with "
+                         "only WiSE-FT pulling back. The concept head is initialised from the Stage-1 ckpt.")
+    ap.add_argument("--concept-aux-w", type=float, default=0.3, help="weight of the auxiliary concept loss")
+    ap.add_argument("--concept-aux-bs", type=int, default=64, help="ambiguous frames per labeled step")
+    ap.add_argument("--concept-aux-buckets", default="HARD_NEG_CANDIDATE,ABSTAIN",
+                    help="which VLM decision buckets feed the auxiliary head")
     ap.add_argument("--semi-buckets", default="",
                     help="restrict the semi pool to these VLM decision buckets, e.g. "
                          "'HARD_NEG_CANDIDATE,ABSTAIN'. When the CONFIDENT_NEGATIVE frames are already being "
@@ -645,6 +708,36 @@ def main():
         print(f"semi: {len(up2)} VLM frames | weight={a.semi_weight} ema={a.ema_decay} conf-neg<{a.semi_lo} "
               f"rampup={a.semi_rampup}ep (consistency + one-sided-PU)")
 
+    # ---- AUXILIARY CONCEPT DISTILLATION on the ambiguous pool (the frames that can take no binary label) ----
+    caux_dl = caux_iter = None
+    if a.concept_aux:
+        if not os.path.exists(a.concept_aux):
+            raise FileNotFoundError(f"--concept-aux {a.concept_aux} does not exist")
+        cz = np.load(a.concept_aux, allow_pickle=True)
+        cpaths = cz["paths"].astype(str); cval = cz["value"]; csup = cz["supervise"]; clab = cz["label"]
+        # ambiguous = unlabeled AND in the requested VLM decision buckets
+        want_c = {b.strip() for b in a.concept_aux_buckets.split(",")}
+        mz = np.load(a.semi_manifest, allow_pickle=True) if a.semi_manifest and os.path.exists(a.semi_manifest) \
+             else np.load("phase3/cache/unl_manifest.npz", allow_pickle=True)
+        dec_by = dict(zip(mz["img_path"].astype(str), mz["decision"].astype(str)))
+        m = (clab < 0) & np.array([dec_by.get(q, "?") in want_c for q in cpaths])
+        # Stage-1 routing: distil only the MAIN (diagnostic) concepts, never the center-cue ones
+        ck_meta = torch.load(a.init, map_location="cpu", weights_only=False) if a.init and os.path.exists(a.init) else {}
+        midx = ck_meta.get("main_idx")
+        if midx is None:
+            midx = list(range(cval.shape[1])); print("[concept-aux] no main_idx in the init ckpt -> using all concepts")
+        cp, cv, cs = cpaths[m], cval[m][:, midx].astype(np.float32), csup[m][:, midx].astype(np.float32)
+        ex = np.array([os.path.exists(q) for q in cp]); cp, cv, cs = cp[ex], cv[ex], cs[ex]
+        net.attach_concept_head(len(midx), ck_meta.get("main_head"))
+        net.to(dev)
+        caux_dl = torch.utils.data.DataLoader(
+            ConceptAuxDS(cp, cv, cs, aug=a.aug, img=IMG), batch_size=a.concept_aux_bs, shuffle=True,
+            num_workers=6, persistent_workers=True, drop_last=True, prefetch_factor=4)
+        caux_iter = iter(caux_dl)
+        print(f"concept-aux: {len(cp):,} ambiguous frames x {len(midx)} MAIN concepts | w={a.concept_aux_w} "
+              f"bs={a.concept_aux_bs}  (these frames have NO usable binary label — this is their only route "
+              f"into the loss, and it holds the encoder on the clinical axes during Stage-2)")
+
     def compute_loss(logits, y, tail):
         terms = a.loss.split("+")
         L = logits.sum() * 0.0
@@ -660,7 +753,7 @@ def main():
     semi_iter = iter(semi_dl) if semi_dl is not None else None
     best = -1
     for ep in range(a.epochs):
-        net.train(); tot = 0; semi_tot = 0.0
+        net.train(); tot = 0; semi_tot = 0.0; caux_tot = 0.0
         if net.head_only:
             net.backbone.eval()         # frozen encoder -> deterministic features (no drop_path/dropout noise)
         tail = ep >= a.warmup           # warm-start on BCE, then add the 90R tail terms
@@ -685,6 +778,22 @@ def main():
             else:
                 sup.backward()
             tot += sup.item()
+            if caux_dl is not None:
+                try:
+                    xa, va, sa = next(caux_iter)
+                except StopIteration:
+                    caux_iter = iter(caux_dl); xa, va, sa = next(caux_iter)
+                xa, va, sa = xa.to(dev), va.float().to(dev), sa.float().to(dev)
+                with torch.autocast(device_type="cuda", enabled=amp):
+                    cl = net.concept_head(net.features(xa))
+                    # supervise-masked soft BCE: a concept the VLM could not assess contributes exactly 0
+                    per = nn.functional.binary_cross_entropy_with_logits(cl, va, reduction="none")
+                    closs = a.concept_aux_w * (per * sa).sum() / sa.sum().clamp(min=1.0)
+                if amp:
+                    scaler.scale(closs).backward()
+                else:
+                    closs.backward()
+                caux_tot += float(closs.detach())
             # SEMI: run --semi-steps unlabeled batches per labeled step (grads ACCUMULATED into the same opt.step),
             # so the semi loss sweeps MUCH more of the pool per epoch (fresh strong-aug each) WITHOUT repeating the
             # labeled set more -> no extra overfitting. Coverage/epoch = nbatches * semi_steps * semi_bs frames.
@@ -732,6 +841,8 @@ def main():
                         be.copy_(bsrc)
         sched.step()
         msg = f"ep{ep+1}/{a.epochs} loss={tot/len(dl):.4f}"
+        if caux_dl is not None:
+            msg += f" caux={caux_tot/max(1,len(dl)):.4f}"
         if semi_dl is not None:
             # DIAGNOSTIC: the supervised loss collapses to ~1e-3 by ep8 (127 memorised positives) while the semi
             # term is what the 145k pool contributes. If semi_loss << sup_loss the pool is decorative — this line
