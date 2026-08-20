@@ -841,3 +841,56 @@ Absolute OOF is not a leaderboard prediction.
 The D2F-4 harness re-ran and again found the CNN member worthless (ViT anchor PPV 0.664 alone; every
 ensemble weight below 1.0 is worse). The resolution-mismatch guard fired correctly on those @448 runs
 against the @336 concept encoder — working as designed.
+
+---
+
+## 19. exp7 deep-dive — the pseudo-positive harm is concentrated on the BOARD-LIKE centre
+
+All 40 fold artifacts recovered (Drive split the download into `max_folds 2/3/4`). Independently
+recomputed from the `.npz` files: the notebook's numbers reproduce exactly
+(nopos/final AUROC 0.9718 / AUPRC 0.8955 / FPR@90R 0.0262).
+
+### 19.1 The pooled A/B understated the damage
+| centre | n | pos | prevalence | AUPRC nopos → pos | **FPR@90R nopos → pos** |
+|---|---:|---:|---:|---|---|
+| **center_1** | 2,279 | 61 | **2.7%** | 0.7790 → 0.7304 | **0.0703 → 0.4270  (6.1× worse)** |
+| center_2 | 816 | 97 | 11.9% | 0.9569 → 0.9700 | 0.0223 → 0.0042 |
+
+Paired gate per centre:
+
+| | AUROC Δ (pos − nopos) | verdict |
+|---|---|---|
+| **center_1** | **−0.0702  CI [−0.1338, −0.0180]** | **FAIL** |
+| center_2 | +0.0069  CI [−0.0089, +0.0269] | inconclusive |
+
+**All of the harm lands on center_1** — the low-prevalence, harder centre, and the one whose regime
+most resembles the hidden test (a new centre at ~1% prevalence). On the easy high-prevalence centre
+the pseudo-positives are harmless. The pooled AUROC Δ of −0.0237 averaged those two apart; the
+board-relevant number is **−0.0702**.
+
+This also matches §6's asymmetry: training on the harder c1 transfers to c2, but not the reverse.
+**center_1 is the honest proxy; center_2 flatters everything.**
+
+### 19.2 The mechanism, measured
+| arm | positives q10 | negatives q99 |
+|---|---:|---:|
+| nopos | **0.0093** | 0.2228 |
+| pos | **0.0042** | 0.0449 |
+
+`FPR@90R` is the fraction of negatives above the 10th-percentile positive. Training 600 pseudo-positives
+at soft 0.80 **pushed the genuine weak positives down 2.2×** (0.0093 → 0.0042), dragging the threshold
+into the negative mass. That is the PU-contamination mechanism the module docstring predicted, now
+observed end-to-end: teaching the model that NDBE look-alikes deserve 0.80 compresses the real
+positives it must rank above them.
+
+### 19.3 Best available board proxy
+`nopos` on **center_1**: AUPRC 0.779, FPR@90R 0.0703 → implied PPV **0.114**, against exp6's actual
+board 0.0195. Still 5.8× optimistic (center_1 is a *seen* centre, the board is unseen), but it is the
+most board-like number the project has produced and it is the one to track across designs.
+
+### 19.4 Status of the artifacts
+All five `fold*_nopos_s0.pt` recovered and verified. They are the **only fully-validated model set in
+the project** — measured out-of-fold, per-centre, with a paired gate. exp8 is strictly more data per
+model (100% of labels vs 80%) but adds `--concept-aux`, which is **unvalidated**. With submissions
+scarce, the nopos ensemble is the evidence-backed artifact and concept-aux should be gated the same
+way pseudo-positives were, on one fold, before it rides in a submission.
