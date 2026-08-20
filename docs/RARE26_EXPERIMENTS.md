@@ -783,3 +783,61 @@ leaderboard is the only measurement. Every change vs exp6 is therefore mechanism
 tuned: 216k negatives because FPR@90R *is* the negative-side rate; +31 real positives because
 positives bind AUPRC; concept-aux because Stage-2 was forgetting Stage-1. If time later allows, a
 single fold (~3 h) buys an OOF sanity check before the closed-phase submission.
+
+---
+
+## 18. exp7 5-fold RESULT — pseudo-positives FAIL, and two of my own reads were wrong
+
+The 5-fold OOF sweep ran. It is the first uncontaminated measurement in the project and it paid for
+itself immediately by killing a lever I had recommended.
+
+### 18.1 The A/B: pseudo-positives lose on every metric
+Pooled out-of-fold, n=3,095, 158 positives, last-epoch scores (no selection):
+
+| arm | AUROC | AUPRC | FPR@90R |
+|---|---:|---:|---:|
+| **nopos** | **0.9718** | **0.8955** | **0.0262** |
+| pos (600 @ soft 0.80) | 0.9476 | 0.8864 | 0.0398 — **52% more FPs** |
+
+Paired gate: **AUROC Δ = −0.0237, CI [−0.0509, −0.0012] → FAIL** (significant harm). AUPRC Δ +0.0006,
+CI spans 0 → inconclusive. The mechanism is exactly the one the module docstring warned about: a
+pseudo-positive that is really NDBE teaches "NDBE looks neoplastic" and raises FPR@90R.
+
+**Why the 4-gate design did not protect us: the gates were not independent.** `suspicion≥0.95` left
+2,381 candidates and the model gate removed **19 of them** (2,381 → 2,362, **0.8%**). The detector and
+the VLM agree almost perfectly, so there was no cross-checking at all — NDBE look-alikes that both
+signals liked went straight in at y=0.80. A gate that agrees with the signal it is meant to check is
+not a gate.
+
+### 18.2 ⚠ exp7_pos/ ON DRIVE IS THE LOSING ARM
+MAX-C ran with `USE_PSEUDO = True`, so `exp7_pos/` holds `fold*_pos_s0.pt` — the arm the gate just
+rejected. **Do not build a container from it.** Re-run MAX-C with `USE_PSEUDO = False` to stage the
+`nopos` folds, which are already trained and sitting in `max_folds/`.
+
+### 18.3 CORRECTION — "loss 0.09 means it is not memorising" was wrong
+I read the pos-arm loss floor (0.0915) as evidence that 216k negatives had stopped the memorisation
+that killed exp6. It was arithmetic, not health: with `pos_weight=7` and a soft target of 0.80 the
+irreducible BCE minimum is
+
+> σ\* = pw·y/(pw·y + 1−y) = 0.966 → loss = 0.870 per pseudo-positive
+> ≈ 9.9 pseudo per 96-batch → **floor = 0.0897**, vs **observed 0.0915**
+
+The nopos arm shows what was really happening: **0.0281 → 0.0058 → 0.0013 by ep3** — full
+memorisation, exactly like exp6's 0.0046. **216k negatives did not prevent it**, because 12 pos/batch
+× 2,599 batches replays each of the 127 positives **246× per epoch**.
+
+### 18.4 CORRECTION — the 9-epoch decision followed from that misread
+exp8 was set to 9 epochs on the strength of "loss still falling at ep3". That trajectory was the
+soft-label floor. With the pos arm removed the loss is at 0.0013 by ep3, so 9 epochs is far past the
+cliff. **exp8 is now 3 epochs** — the setting these OOF numbers were actually measured at.
+
+### 18.5 What the OOF numbers do and do not say
+`nopos` reads FPR@90R 0.0262 → implied PPV 0.256, against exp6's actual board 0.0195. The OOF folds
+are random splits of the **same two centres**, so this is a same-centre number and overstates the
+board by ~13×. Its value is the **delta between arms**, which is what killed the pseudo-positive arm.
+Absolute OOF is not a leaderboard prediction.
+
+### 18.6 Unchanged
+The D2F-4 harness re-ran and again found the CNN member worthless (ViT anchor PPV 0.664 alone; every
+ensemble weight below 1.0 is worse). The resolution-mismatch guard fired correctly on those @448 runs
+against the @336 concept encoder — working as designed.
