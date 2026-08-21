@@ -894,3 +894,62 @@ the project** — measured out-of-fold, per-centre, with a paired gate. exp8 is 
 model (100% of labels vs 80%) but adds `--concept-aux`, which is **unvalidated**. With submissions
 scarce, the nopos ensemble is the evidence-backed artifact and concept-aux should be gated the same
 way pseudo-positives were, on one fold, before it rides in a submission.
+
+---
+
+## 20. exp7 LEADERBOARD — null result, and the mechanism is a design error I made
+
+| | PPV@90R | AUROC | AUPRC | Val-RARE25 AUPRC |
+|---|---:|---:|---:|---:|
+| exp6 | 0.0195 | 0.8602 | 0.3900 | 0.6154 |
+| exp7 | **0.0195** | 0.8479 | 0.3790 | **0.5347** |
+
+**Not a submission mix-up** — AUROC/AUPRC and both Val-RARE25 rows differ, so the models are genuinely
+different. The identical PPV is a coincidence of the bootstrap median (CI [0.0094, 0.1139]). The real
+signal is **Val-RARE25 AUPRC 0.6154 → 0.5347 (−13%)**, on a set the organizers hold out and that is in
+neither model's training data. exp7 is mildly **worse**, not tied.
+
+### 20.1 Why: I recommended volume over hardness, and it was backwards
+Scored 600 frames from each pool bucket with the exp6 model (which never saw them), against the 90R
+threshold set by the 31 held-out val positives (0.09707):
+
+| bucket | median score | **% above the 90R threshold** |
+|---|---:|---:|
+| val positives | 0.99094 | 87.1% |
+| val negatives | 0.00072 | 0.7% |
+| **CONFIDENT_NEGATIVE** — the 216k exp7 **added** as y=0 | **0.00153** | **4.7%** |
+| **HARD_NEG_CANDIDATE** — the 60k exp7 **excluded** | **0.92238** | **91.5%** |
+
+**19.6× ratio.** exp7 added 216k frames the model already answers correctly — near-zero gradient once
+fitted (training loss confirms it: 0.0281 → 0.0058 → 0.0013 by ep3) — while withholding the 60k that
+*constitute* the FP tail `FPR@90R` is computed from. The metric is the fraction of negatives above the
+threshold; we trained on the ones already below it.
+
+### 20.2 Three treatments of HARD_NEG_CANDIDATE, all now measured
+| treatment | result |
+|---|---|
+| y = 1 (pseudo-positives) | **FAIL** — center_1 FPR@90R 0.0703 → 0.4270 (§19) |
+| excluded entirely | **NULL** — exp7, 91.5% of the FP tail never trained |
+| y = 0 for all 60k | untested; ~1% contamination × 60k ≈ 600 manufactured false negatives against only 127 real positives (§5's objection, and it is a real one) |
+
+### 20.3 The middle path was already in the repo and never used
+`mine_hardneg.py --concept-rank` mines **concept-confounded** frames — high on surface confounders,
+**low on decisive architectural hallmarks** — with a PU guard (`decisive < labeled-positive median`)
+that drops likely hidden positives. It kept 137,702 of 167,724 unlabeled frames and ranks the
+confounded band. Scored with exp6:
+
+| source | % above 90R threshold |
+|---|---:|
+| CONFIDENT_NEGATIVE | 4.7% |
+| **CTM (PU-guarded)** | **57.0%** |
+| HARD_NEG_CANDIDATE raw | 91.5% |
+
+Exactly the intended regime: hard enough to produce gradient at the boundary, guarded against the
+true positives that made the pseudo-positive arm fail.
+
+### 20.4 exp8 revision
+Replace the "volume" negative set with a **mixture**: a moderate CONFIDENT_NEGATIVE sample for broad
+normal coverage plus CTM-mined hard negatives at the boundary. Contamination budget matters — at ~4%
+CTM contamination, 5,000 frames ≈ 200 manufactured false negatives against 158 real positives, so the
+cap stays small and **this must be gated on one fold before it ships**. Every ungated lever in this
+project has failed; every gated one has been caught.
