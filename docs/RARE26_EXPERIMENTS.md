@@ -1003,3 +1003,24 @@ and rides in both arms, so the gate measures CTM only.
 3. **Pseudo-domain discovery by embedding clustering** → GroupDRO/Fishr across discovered domains.
    `dir` is not a domain label (§15.4), so domains must be discovered; this is the only lever that
    attacks transfer *directly* rather than through variance reduction.
+
+### 21.5 Review pass — three defects in exp9, found before it ran
+1. **The shipped model was not the measured model.** Under `--fold`, `a.out` is written only at the
+   best-AUPRC epoch, so `_loco_final.npz` (last-epoch *scores*) described weights that were never
+   saved. Since exp7 showed last-epoch pooled OOF beats best-epoch (FPR 0.0262 vs 0.0361 — selecting
+   on ~31 held-out positives is selecting on noise), `finetune.py` now also writes
+   `<out>_final.pt` and WiSE-FTs it with the same anchor. exp9-SHIP stages those.
+2. **`exp9-SHIP` referenced `E9`, defined only in `exp9-GATE`** — running SHIP without GATE was a
+   `NameError`. SHIP now defines it.
+3. **Positive repetition was still 270×.** exp6 — still the best board score — replayed each positive
+   ~**20×** across all of training; exp7 replayed **592×** and memorised (loss 0.0013 by ep3). exp9
+   now uses 5 epochs × 8 pos/batch at 424 steps/epoch = **107×**, five times less than exp7 and as
+   close to exp6's regime as a 35k negative sweep allows.
+
+Final budget: 424 steps/epoch × 5 epochs = 2,120 steps/model, negatives swept 5×, **4.4 GPU-hours for
+15 members**.
+
+**The largest remaining ungated risk is positive repetition (107× vs exp6's 20×).** It cannot be
+reduced further without either starving the negative sweep or dropping `--pos-per-batch` below the
+point where the q=0.0625 pAUC quantile is estimable. Watch the training loss: **if it reaches ~0.005
+the model is memorising again and epochs should drop to 3.**

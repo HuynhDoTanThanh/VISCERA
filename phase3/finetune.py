@@ -871,6 +871,11 @@ def main():
             # is the honest estimate, the best-epoch one is for like-for-like arm comparisons.
             if ep == a.epochs - 1:
                 np.savez(a.out[:-3] + "_loco_final.npz", y=np.array(labels[vam]), c=np.array(centers[vam]), s=s)
+                # ...and the WEIGHTS that produced them. Without this only the best-AUPRC checkpoint exists,
+                # so `_loco_final.npz` (last-epoch scores) describes a model you cannot actually ship -- and on
+                # exp7 the last-epoch pooled OOF was BETTER than best-epoch (FPR 0.0262 vs 0.0361), because
+                # selecting on ~31 held-out positives is selecting on noise.
+                torch.save({"model": net.state_dict(), "cfg": vars(a), "epoch": "final"}, a.out[:-3] + "_final.pt")
         print(msg, flush=True)
         if a.swad and ep >= a.epochs - a.swad_last_n:   # accumulate the flat tail of the trajectory
             sd = net.state_dict()
@@ -929,6 +934,7 @@ def main():
         ck["model"] = st; torch.save(ck, path)
         print(f"applied WiSE-FT alpha={a.wise_ft} -> {path}")
     apply_wise_ft(a.out)
+    apply_wise_ft(a.out[:-3] + "_final.pt")      # same OOD anchor as the best-epoch checkpoint
     if swad_out and swad_out != a.out:
         apply_wise_ft(swad_out)
     if ema_out:
