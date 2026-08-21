@@ -28,10 +28,27 @@ def _dev():
 
 class CNNNet(nn.Module):
     """timm CNN (num_classes=0 -> global-pooled features) + a concept head (Stage-1) + a binary head (Stage-2)."""
-    def __init__(self, arch="convnext_tiny", pretrained=True):
+    def __init__(self, arch="convnext_tiny", pretrained=True, weights_path=""):
+        """weights_path: a state_dict to load INSTEAD of timm's ImageNet weights. This is how the
+        GastroNet-5M ResNet-50 gets in (huggingface.co/tgwboers/GastroNet-5M_Pretrained_Weights).
+        It matters: RARE25's winner built half its 40-model ensemble on GastroNet-ResNet50, and our
+        own CNN member failed as an *ImageNet* ConvNeXt -- in-domain pretraining is the untested
+        variable, not the CNN family itself."""
         super().__init__()
         self.arch = arch
-        self.backbone = timm.create_model(arch, pretrained=pretrained, num_classes=0)
+        self.backbone = timm.create_model(arch, pretrained=pretrained and not weights_path, num_classes=0)
+        if weights_path:
+            import torch as _t, os as _os
+            assert _os.path.exists(weights_path), f"--pretrained-path {weights_path} not found"
+            sd = _t.load(weights_path, map_location="cpu", weights_only=False)
+            for k in ("state_dict", "model", "backbone"):
+                if isinstance(sd, dict) and k in sd: sd = sd[k]
+            sd = {kk.replace("module.", "").replace("backbone.", ""): vv for kk, vv in sd.items()}
+            miss, unexp = self.backbone.load_state_dict(sd, strict=False)
+            kept = len(sd) - len(unexp)
+            assert kept > 50, f"only {kept} tensors matched {arch} — wrong checkpoint layout?"
+            print(f"[cnn] loaded {kept} tensors from {weights_path} "
+                  f"(missing={len(miss)} unexpected={len(unexp)})")
         d = self.backbone.num_features
         self.dim = d
         self.concept_head = nn.Linear(d, NC)
@@ -128,7 +145,7 @@ def train_concept(a):
     cen = d["center"]; keep = np.isin(cen, ["center_1", "center_2"]) if a.labeled_only else np.ones(len(cen), bool)
     paths = d["paths"][keep]; value = d["value"][keep].astype(np.float32); sup = d["supervise"][keep].astype(np.float32)
     print(f"[concept] {len(paths)} frames | supervised cells/concept avg={sup.mean(0).mean():.2f}", flush=True)
-    net = CNNNet(a.arch, pretrained=not a.scratch).to(dev)
+    net = CNNNet(a.arch, pretrained=not a.scratch, weights_path=a.pretrained_path).to(dev)
     dl = torch.utils.data.DataLoader(ConceptDS(paths, value, sup, a.img), batch_size=a.bs, shuffle=True,
                                      num_workers=a.workers, drop_last=True)
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=a.wd)
@@ -151,7 +168,7 @@ def train_finetune(a):
         rows = [r for r in rows if r["center"] != a.holdout]
     paths = [r["path"] for r in rows]; labels = np.array([int(r["label"]) for r in rows])
     print(f"[finetune] {len(paths)} frames pos={labels.sum()} holdout={a.holdout}", flush=True)
-    net = CNNNet(a.arch, pretrained=True).to(dev)
+    net = CNNNet(a.arch, pretrained=True, weights_path=a.pretrained_path).to(dev)
     init0 = None
     if a.init:
         ck = torch.load(a.init, map_location="cpu"); net.backbone.load_state_dict(ck["backbone"]);
@@ -217,6 +234,10 @@ def main():
     ap.add_argument("--stage", choices=["concept", "finetune"], required=True)
     ap.add_argument("--arch", default="convnext_tiny", help="convnext_tiny (768-d) | resnet50 (2048-d, winner's family)")
     ap.add_argument("--img", type=int, default=224)
+    ap.add_argument("--pretrained-path", default="",
+                    help="state_dict to load instead of timm ImageNet weights, e.g. a GastroNet-5M "
+                         "ResNet-50. The winner's second family; our ConvNeXt member failed on ImageNet "
+                         "weights, so in-domain pretraining is the variable that was never tested.")
     ap.add_argument("--targets", default="phase3/cache/concept_targets.npz")
     ap.add_argument("--labeled-only", action="store_true", help="Stage-1 on labeled frames only (fast smoke); default = full pool")
     ap.add_argument("--train-csv", default="train_colab.csv")

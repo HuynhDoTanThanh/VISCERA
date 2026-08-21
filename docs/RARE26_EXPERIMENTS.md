@@ -1024,3 +1024,36 @@ Final budget: 424 steps/epoch × 5 epochs = 2,120 steps/model, negatives swept 5
 reduced further without either starving the negative sweep or dropping `--pos-per-batch` below the
 point where the q=0.0625 pAUC quantile is estimable. Watch the training loss: **if it reaches ~0.005
 the model is memorising again and epochs should drop to 3.**
+
+### 21.6 Using a 24-hour budget — exp9 alone only needs 4.4h
+| spend | hours | why |
+|---|---:|---|
+| **exp9-GATE, factorial (4 arms)** | **1.2** | two of exp9's three levers ride ungated in all 15 members |
+| exp9-SHIP, 15 members | 4.4 | the winner's proven lever, never tried at scale here |
+| **GastroNet ResNet-50 family** | ~7 | the winner's *other* half; largest untried structural lever |
+| more ViT seeds (15 → 25) | 3 | reliable but diminishing (variance ∝ 1/√n) |
+| slack | 8.4 | Colab drops, reruns, container build |
+
+**Spend the first 1.2h on the gate, not on more members.** exp9 carries three levers and only CTM was
+scheduled for measurement:
+
+| lever | status |
+|---|---|
+| CTM hard negatives | 57% at the boundary vs 4.7% — measured on *our* centres, transfer unproven |
+| **concept-aux** | caux 0.217 vs semi 0.003 — measured as *gradient*, **never A/B'd for accuracy** |
+| **107× positive repetition** | exp6 (best board score) used 20×; exp7 used 592× and memorised |
+
+The gate is one-factor-at-a-time from a common baseline on fold 0 (`full` / `noctm` / `nocaux` /
+`lowrep`), reported pooled **and on center_1**, because §19 showed a pooled number can hide a 6×
+regression that lands entirely on the board-like leg.
+
+### 21.7 GastroNet-5M ResNet-50 — the enabler is now in place
+`cnn_member.py --pretrained-path` loads an arbitrary state_dict instead of timm's ImageNet weights,
+with a loud assert if fewer than 50 tensors match. This is what the RARE25 winner's other 20 models
+were built on (`huggingface.co/tgwboers/GastroNet-5M_Pretrained_Weights`).
+
+Why this is not a repeat of the failed CNN member: that member was **ImageNet**-pretrained ConvNeXt,
+and §7 measured it tail-poisoning the ensemble at every weight. In-domain pretraining is the variable
+that was never tested — and our own evidence says it dominates architecture (GastroNet-DINOv2 ViT-B
+scored 0.854 while *generic* DINOv3 ViT-B scored 0.756). Gate it exactly like the ViT levers: admit
+to the ensemble only if it improves the fused OOF on **center_1**, never on the pooled number alone.
