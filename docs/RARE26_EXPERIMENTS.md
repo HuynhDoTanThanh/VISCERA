@@ -1082,3 +1082,30 @@ MixStyle at @336. Added as a fifth gate arm (`mixsty`) for ~0.3 GPU-hours.
 
 Revised 24h plan: **1.5h** gate (5 arms) · **4.4h** ship 15 members · **7.5h** extend the ensemble to
 ~40 with *recipe* diversity (varied `--unfreeze`, exp6-style and exp9-style members) · **10.6h** slack.
+
+### 21.9 @448 RE-OPENED — the evidence against it is one run, not four
+
+§8 called @336 > @448 "a consistent 4-experiment AUROC signal". Auditing the shipped cfgs shows that
+is overstated:
+
+| run | img | AUROC | what else was different |
+|---|---|---:|---|
+| exps/2 | 336 | 0.854 | baseline |
+| exps/3 | 448 | 0.756 | **dinov3 backbone** (frozen-LP 0.835 vs dinov2 0.929) + untrained CG-AMIL + `aug=strong` + 15 ep |
+| exps/4 | 448 | 0.829 | **untrained CG-AMIL** + mixstyle + 15 ep |
+| exps/5 | 448 | 0.797 | cleanest — but **15 epochs vs 12** |
+
+exps/3 failed for a reason we can name — the backbone. exps/4 carried an attention head that we
+later proved **was never in the optimizer** (§10.2), i.e. a random projection. That leaves **exps/5 as
+the only near-clean comparison**, and it ran 25% more epochs — which we now know means more
+memorisation (exp7 reached loss 0.0013 by ep3).
+
+So the honest statement is: **one near-clean run with an epoch confound**, not four. Retesting costs
+0.55 GPU-hours on a pipeline where the attention bug is fixed, epochs are controlled, the negatives
+are real, and the concept encoder's resolution is tracked. Added as gate arm `img448`.
+
+**Caveat stated plainly:** `concept_encoder.pt` is @336, so this arm interpolates `pos_embed` — a
+partial test. If @448 wins on center_1, the follow-up before shipping is a @448 Stage-1 encoder
+(~13.5h), which the 24h budget can absorb.
+
+Gate is now 6 arms, ~2.0 GPU-hours: full / noctm / nocaux / lowrep / mixsty / img448.
