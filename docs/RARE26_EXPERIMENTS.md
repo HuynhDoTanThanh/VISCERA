@@ -953,3 +953,53 @@ normal coverage plus CTM-mined hard negatives at the boundary. Contamination bud
 CTM contamination, 5,000 frames ≈ 200 manufactured false negatives against 158 real positives, so the
 cap stays small and **this must be gated on one fold before it ships**. Every ungated lever in this
 project has failed; every gated one has been caught.
+
+---
+
+## 21. exp9 — the design that follows from everything measured
+
+### 21.1 The problem restated correctly
+| | FPR@90R |
+|---|---:|
+| center_2 (OOF, 11.9% prevalence) | 0.0223 |
+| center_1 (OOF, 2.7% prevalence) | 0.0703 |
+| **hidden test (new centre)** | **0.4525** |
+
+The boundary is *fine* on centres we have seen and collapses 6–20× on one we have not. **The problem
+is not the decision boundary, it is that the boundary does not transfer.** Every single-model lever
+aimed at sharpening the boundary on our own data has therefore come back null or negative.
+
+### 21.2 exp9 vs exp7, and why each change
+| | exp7 (null) | **exp9** | reason |
+|---|---|---|---|
+| negatives | 215,986 all-easy | **30k easy + 5k CTM** | 4.7% vs 57% above threshold — exp7 trained where the model was already right |
+| steps/epoch | 2,599 | **445** | smaller *and* harder |
+| positive repetition | 197×/epoch | **34×/epoch** | exp7 memorised by ep3 (loss 0.0013) |
+| epochs | 3 | **8** | real LR annealing, SWAD window |
+| ambiguous 73.5k frames | semi (loss 0.003) | **concept-aux (0.217)** | 70× the gradient at half the compute |
+| ensemble | 5 | **15** (5 folds × 3 seeds) | the winner shipped 40; this is the one proven lever never tried at scale |
+| checkpoint | best-epoch | **last-epoch** | best-epoch selection on 31 positives gave *worse* pooled OOF (0.0361 vs 0.0262) |
+| pseudo-positives | 600 | **none** | gated and failed (§19) |
+
+Budget: 445 steps/epoch × 8 epochs = 3,560 steps/model, **0.5 h/model, 7.4 GPU-hours for 15** — less
+than exp7 cost, because the wasted easy negatives are gone.
+
+### 21.3 What exp9 does NOT claim
+CTM is **57% above threshold on our own centres**. That fixes exp7's "no gradient" defect; it does
+**not** prove it transfers to a new centre — sharpening a boundary on seen data is exactly what has
+failed repeatedly here. Hence `exp9-GATE`: one fold, CTM vs same-size all-easy, read **center_1**
+(§19 showed a pooled number can hide a 6× regression that lands entirely on the board-like leg).
+
+Every ungated lever in this project has failed — pseudo-positives, 216k easy negatives, CG-AMIL, the
+CNN member. Every gated one was caught before it cost a submission. concept-aux is also still ungated
+and rides in both arms, so the gate measures CTM only.
+
+### 21.4 Left on the table, ranked
+1. **GastroNet-5M ResNet-50 as a second family** (public weights). The winner's other half; our CNN
+   member failed but it was *ImageNet* ConvNeXt, not in-domain. This is the largest untried
+   structural lever.
+2. **Per-member ECDF normalisation before prob-fusion** — the only non-monotone (hence real) reading
+   of IMSY's "affine recalibration"; needs a reference set shipped in `resources/`.
+3. **Pseudo-domain discovery by embedding clustering** → GroupDRO/Fishr across discovered domains.
+   `dir` is not a domain label (§15.4), so domains must be discovered; this is the only lever that
+   attacks transfer *directly* rather than through variance reduction.
