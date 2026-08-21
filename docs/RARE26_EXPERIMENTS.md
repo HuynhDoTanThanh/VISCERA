@@ -1057,3 +1057,28 @@ and §7 measured it tail-poisoning the ensemble at every weight. In-domain pretr
 that was never tested — and our own evidence says it dominates architecture (GastroNet-DINOv2 ViT-B
 scored 0.854 while *generic* DINOv3 ViT-B scored 0.756). Gate it exactly like the ViT levers: admit
 to the ensemble only if it improves the fused OOF on **center_1**, never on the pooled number alone.
+
+### 21.8 GastroNet ResNet-50 dropped (user call) — MixStyle takes the slot instead
+
+Removing that family leaves ~18h after the gate and ship. The best use is **not** more seeds of the
+same recipe: ensembling reduces *variance*, and our problem is *bias* — a boundary fitted to two
+centres. FPR@90R is 0.0223/0.0703 on centres we have seen and 0.4525 on one we have not.
+
+**MixStyle is the only implemented lever that attacks that bias directly.** It mixes per-token
+feature statistics across the batch, synthesising unseen-centre acquisition styles at the feature
+level; param-free, train-only, identity at eval, so the shipped graph is unchanged.
+
+It has **never been measured on its own**. Its single appearance was inside the exps/4 bundle:
+
+| exps/4 | value |
+|---|---|
+| img | **448** (the resolution 4 experiments proved regressive) |
+| cg_head | **True** — and we later found AttnPool was *never in the optimizer*, so that head was random |
+| mixstyle | True |
+| LB AUROC | 0.829 |
+
+That bundle's failure is attributable to @448 and a random attention head. It says nothing about
+MixStyle at @336. Added as a fifth gate arm (`mixsty`) for ~0.3 GPU-hours.
+
+Revised 24h plan: **1.5h** gate (5 arms) · **4.4h** ship 15 members · **7.5h** extend the ensemble to
+~40 with *recipe* diversity (varied `--unfreeze`, exp6-style and exp9-style members) · **10.6h** slack.
